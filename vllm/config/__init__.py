@@ -1855,7 +1855,7 @@ class DeviceConfig:
 
 SpeculativeMethod = Literal["ngram", "eagle", "eagle3", "medusa",
                             "mlp_speculator", "draft_model", "deepseek_mtp",
-                            "ernie_mtp", "qwen3_next_mtp"]
+                            "ernie_mtp", "qwen3_next_mtp", "ssr"]
 
 
 @config
@@ -1955,6 +1955,7 @@ class SpeculativeConfig:
         # Eagle3 affects the computation graph because it returns intermediate
         # hidden states in addition to the final hidden state.
         factors.append(self.method == "eagle3")
+        factors.append(self.method == "ssr")
         hash_str = hashlib.md5(str(factors).encode(),
                                usedforsecurity=False).hexdigest()
         return hash_str
@@ -2034,6 +2035,9 @@ class SpeculativeConfig:
                     self.quantization = self.target_model_config.quantization
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
+            elif self.method == "ssr":
+                # use the draft model from the same model:
+                self.model = self.target_model_config.model
             else:
                 raise ValueError("num_speculative_tokens was provided without "
                                  "speculative model.")
@@ -2109,6 +2113,8 @@ class SpeculativeConfig:
 
                 # Automatically detect the method
                 if self.method in ('eagle', 'eagle3'):
+                    pass
+                elif self.method == "ssr":
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B

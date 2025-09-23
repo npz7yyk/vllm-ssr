@@ -79,6 +79,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.ssr import SSRProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -266,6 +267,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self.drafter = MedusaProposer(
                     vllm_config=self.vllm_config,
                     device=self.device)  # type: ignore
+            elif self.speculative_config.method == "ssr":
+                self.drafter = SSRProposer(self.vllm_config, self.device, self)
             else:
                 raise ValueError("Unknown speculative decoding method: "
                                  f"{self.speculative_config.method}")
@@ -509,6 +512,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+        # Remove finished requests from the draft probabilities of SSR.
+        if self.vllm_config.speculative_config and \
+                self.vllm_config.speculative_config.method == "ssr":
+            # Only remove when necessary.
+            if scheduler_output.finished_req_ids:
+                running_req_mask = torch.ones(
+                    len(self.input_batch.req_id_to_index),
+                    dtype=torch.bool, device=self.device
+                )
+                for id, idx in self.input_batch.req_id_to_index.items():
+                    if id in scheduler_output.finished_req_ids:
+                        running_req_mask[idx] = False
+                # Apply the mask to draft_probs
+                self.drafter.draft_probs = \
+                    self.drafter.draft_probs[running_req_mask]
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1863,7 +1881,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             target_logits = logits[spec_decode_metadata.target_logits_indices]
             output_token_ids = self.rejection_sampler(
                 spec_decode_metadata,
-                None,  # draft_probs
+                # NOTE(Yikang): REAL rejection sampling needs draft_probs!
+                self.drafter.draft_probs
+                if isinstance(self.drafter, SSRProposer) else None,
                 target_logits,
                 bonus_token_ids,
                 sampling_metadata,
@@ -2294,6 +2314,61 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                sampling_metadata=sampling_metadata,
+                common_attn_metadata=common_attn_metadata,
+                mm_embeds=mm_embeds,
+            )
+        elif self.speculative_config.method == "ssr":
+            assert isinstance(self.drafter, SSRProposer)
+            # TODO(woosuk): Refactor the loop.
+            req_ids = self.input_batch.req_ids
+            next_token_ids: list[int] = []
+            for i, token_ids in enumerate(sampled_token_ids):
+                if token_ids:
+                    # Common case.
+                    next_token_id = token_ids[-1]
+                else:
+                    # Partial prefill (rare case).
+                    # Get the next token id from the request state.
+                    req_id = req_ids[i]
+                    req_state = self.requests[req_id]
+                    seq_len = (req_state.num_computed_tokens +
+                               scheduler_output.num_scheduled_tokens[req_id])
+                    next_token_id = req_state.get_token_id(seq_len)
+                next_token_ids.append(next_token_id)
+            next_token_ids = torch.tensor(next_token_ids,
+                                          dtype=torch.int32,
+                                          device=self.device)
+
+            if spec_decode_metadata is None:
+                # input_ids can be None for multimodal models.
+                target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
+                # TODO(woosuk): Support M-RoPE.
+                target_positions = self.positions.gpu[:num_scheduled_tokens]
+            else:
+                # TODO(woosuk): Refactor this.
+                num_draft_tokens = spec_decode_metadata.num_draft_tokens
+                num_rejected_tokens = [
+                    n + 1 - len(sampled_token_ids[i]) if n > 0 else 0
+                    for i, n in enumerate(num_draft_tokens)
+                ]
+                num_rejected_tokens_cpu = torch.tensor(num_rejected_tokens,
+                                                       dtype=torch.int32)
+                common_attn_metadata, token_indices =\
+                    self.drafter.prepare_inputs(
+                        common_attn_metadata, num_rejected_tokens_cpu)
+
+                target_token_ids = self.input_ids.gpu[token_indices]
+                # TODO(woosuk): Support M-RoPE.
+                target_positions = self.positions.gpu[token_indices]
+            mm_embeds = None
+            if self.supports_mm_inputs:
+                mm_embeds = self._gather_mm_embeddings(scheduler_output,
+                                                       shift_computed_tokens=1)
+            draft_token_ids = self.drafter.propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
                 next_token_ids=next_token_ids,
                 sampling_metadata=sampling_metadata,
                 common_attn_metadata=common_attn_metadata,
