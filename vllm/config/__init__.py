@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig)
     from vllm.v1.sample.logits_processor import LogitsProcessor
+    from vllm.v1.spec_decode.attn_overrider import SSRConfig
 
     HfOverrides = Union[dict, Callable[[type], type]]
 else:
@@ -79,6 +80,7 @@ else:
     QuantizationMethods = Any
     BaseModelLoader = Any
     LogitsProcessor = Any
+    SSRConfig = Any
     HfOverrides = Union[dict[str, Any], Callable[[type], type]]
 
     me_quant = LazyLoader("model_executor", globals(),
@@ -1902,6 +1904,8 @@ class SpeculativeConfig:
     """The specific revision to use for the draft model code on Hugging Face
     Hub. It can be a branch name, a tag name, or a commit id. If unspecified,
     will use the default version."""
+    ssr_config: Optional[SSRConfig] = None
+    """The configuration for method SSR, if applicable."""
 
     # Advanced control
     disable_by_batch_size: Optional[int] = None
@@ -1955,6 +1959,7 @@ class SpeculativeConfig:
         # Eagle3 affects the computation graph because it returns intermediate
         # hidden states in addition to the final hidden state.
         factors.append(self.method == "eagle3")
+        # SSR may affect the computation graph, be conservative here.
         factors.append(self.method == "ssr")
         hash_str = hashlib.md5(str(factors).encode(),
                                usedforsecurity=False).hexdigest()

@@ -1,41 +1,92 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import ast
-from dataclasses import replace
-from importlib.util import find_spec
-from typing import Optional, Protocol, TYPE_CHECKING
+from typing import Optional, Callable, TYPE_CHECKING
 
+import functools
 import numpy as np
+import re
 import torch
 import torch.nn as nn
 
 from vllm.attention.layer import Attention
-from vllm.compilation.cuda_graph import CUDAGraphWrapper
-from vllm.config import (CompilationLevel, CUDAGraphMode, VllmConfig,
+from vllm.attention.utils.fa_utils import is_flash_attn_varlen_func_available
+from vllm.config import (CompilationLevel, VllmConfig,
                          get_layers_from_vllm_config)
-from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader import get_model
-from vllm.model_executor.models import supports_multimodal
-from vllm.platforms import current_platform
-from vllm.utils import is_pin_memory_available, round_up
-from vllm.v1.attention.backends.flash_attn import (
-    FlashAttentionMetadata, _DEFAULT_MAX_NUM_SPLITS_FOR_CUDA_GRAPH)
-from vllm.v1.attention.backends.tree_attn import (TreeAttentionMetadata,
-                                                  TreeAttentionMetadataBuilder)
-from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+from vllm.utils import is_pin_memory_available
+from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import compute_probs
+from vllm.v1.spec_decode.attn_overrider import build_attention_overrider
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
 
 PADDING_SLOT_ID = -1
+
+
+def _wrap_func(enter: str = "", exit: str = "") -> Callable:
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            inst = args[0] if args else None
+            enter_fn = getattr(inst, enter) if enter else lambda: None
+            exit_fn = getattr(inst, exit) if exit else lambda: None
+
+            if enter_fn:
+                enter_fn()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if exit_fn:
+                    exit_fn()
+        return wrapper
+    return deco
+
+
+class LayerIndexer:
+    """A utility class to iterate over layer indices."""
+
+    def __init__(self, attn_layer_names: set[str]):
+        # Collect layer indices from layer names.
+        between_dots = re.compile(r'\.(\d+)\.')
+        any_digits = re.compile(r'\d+')
+        layer_indices = []
+        # Try to extract the layer index from the layer name.
+        for name in attn_layer_names:
+            # Try1: match digits between dots.
+            match = between_dots.search(name)
+            if match:
+                layer_indices.append(int(match.group(1)))
+                continue
+            # Try2: match any digits, take the first match.
+            match = any_digits.search(name)
+            if match:
+                layer_indices.append(int(match.group(0)))
+                continue
+            # Failed to parse the layer index.
+            layer_indices = list(range(len(attn_layer_names)))
+            logger.warning(
+                f"Failed to parse layer index from attention layer: {name}, "
+                f"Try fallback to use 0, 1, ..., {len(attn_layer_names) - 1}."
+            )
+            break
+
+        # Build the layer index iterator.
+        self._layer_indices = sorted(set(layer_indices))
+        self._num_layers = len(self._layer_indices)
+        self._current_pos = 0
+
+    @property
+    def current_layer_index(self) -> int:
+        # Return the current layer and move to the next one.
+        rst = self._layer_indices[self._current_pos]
+        self._current_pos = (self._current_pos + 1) % self._num_layers
+        return rst
 
 
 class SSRProposer:
@@ -47,6 +98,7 @@ class SSRProposer:
         runner: "GPUModelRunner",
     ):
         self.vllm_config = vllm_config
+        self.device = device
         self.speculative_config = vllm_config.speculative_config
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
@@ -55,6 +107,7 @@ class SSRProposer:
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
         self.block_size = vllm_config.cache_config.block_size
+        self.vocab_size = vllm_config.model_config.get_vocab_size()
         self.num_speculative_tokens = \
             self.speculative_config.num_speculative_tokens
         self.max_num_tokens = \
@@ -78,50 +131,23 @@ class SSRProposer:
 
         max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.arange = torch.arange(
-            # We need +1 here because the arange is used to set query_start_loc,
+            # Need +1 here because the arange is used to set query_start_loc,
             # which has one more element than batch_size.
             max_batch_size + 1,
             device=device,
             dtype=torch.int32,
         )
+        # Lazy allocation of buffers.
+        self._draft_probs = None
+        self._sampled_token_ids = None
 
         # Determine allowed attention backends once during initialization.
-        self.allowed_attn_types: tuple
-        if current_platform.is_rocm():
-            rocm_types = [TritonAttentionMetadata, FlashAttentionMetadata]
-            # vllm.v1.attention.backends.rocm_aiter_fa is an optional backend
-            if find_spec("vllm.v1.attention.backends.rocm_aiter_fa"):
-                from vllm.v1.attention.backends.rocm_aiter_fa import (
-                    AiterFlashAttentionMetadata)
-                rocm_types.append(AiterFlashAttentionMetadata)
-            self.allowed_attn_types = tuple(rocm_types)
-        else:
-            self.allowed_attn_types = (FlashAttentionMetadata,
-                                       TreeAttentionMetadata)
-
-        # Parse the speculative token tree.
-        spec_token_tree = self.speculative_config.speculative_token_tree
-        self.tree_choices: list[tuple[int,
-                                      ...]] = ast.literal_eval(spec_token_tree)
-        tree_depth = len(self.tree_choices[-1])
-        # Precompute per-level properties of the tree.
-        num_drafts_per_level = [0] * tree_depth
-        for node in self.tree_choices:
-            num_drafts_per_level[len(node) - 1] += 1
-        self.cu_drafts_per_level = [num_drafts_per_level[0]]
-        self.child_drafts_per_level = [num_drafts_per_level[0]]
-        for level in range(1, tree_depth):
-            self.cu_drafts_per_level.append(self.cu_drafts_per_level[-1] +
-                                            num_drafts_per_level[level])
-            self.child_drafts_per_level.append(num_drafts_per_level[level] //
-                                               num_drafts_per_level[level - 1])
-        # Precompute draft position offsets in flattened tree.
-        self.tree_draft_pos_offsets = torch.arange(
-            1,
-            len(self.tree_choices) + 1,
-            device=device,
-            dtype=torch.int32,
-        ).repeat(max_batch_size, 1)
+        self.allowed_attn_types = (FlashAttentionMetadata,)
+        import vllm.v1.attention.backends.flash_attn as flash_attn_module
+        self.flash_attn_module = flash_attn_module
+        assert is_flash_attn_varlen_func_available(), \
+            "FlashAttention with variable length support is required for SSR."
+        self._original_func = None
 
     def _sample(
         self,
@@ -133,13 +159,45 @@ class SSRProposer:
         """
         return self.runner.sampler(logits, sampling_metadata)
 
+    def enable_attn_override(self):
+        # Override function for attention to enable SSR.
+        def overrided_attention(*args, **kwargs):
+            layer_index = self.layer_indexer.current_layer_index
+            use_private_attention = self.attention_overrider(
+                layer_index=layer_index,
+                *args, **kwargs
+            )
+            # Attention already conducted inside the overrider.
+            if use_private_attention:
+                return
+            # The overrider only modifies the attention metadata.
+            # Call the original attention function.
+            self._original_func(*args, **kwargs)
+
+        # Save the original function for the first time.
+        if self._original_func is None:
+            self._original_func = self.flash_attn_module.flash_attn_varlen_func
+        # Override the function.
+        self.flash_attn_module.flash_attn_varlen_func = overrided_attention
+
+    def disable_attn_override(self):
+        # Restore the original function.
+        self.flash_attn_module.flash_attn_varlen_func = self._original_func
+
+    def get_draft_probs(self, running_req_mask: torch.Tensor) -> torch.Tensor:
+        # [batch_size * num_speculative_tokens, vocab_size]
+        running_req_mask = running_req_mask[:self.batch_size]
+        return self._draft_probs[:self.batch_size][running_req_mask]. \
+            reshape(-1, self.vocab_size)
+
+    @property
+    def sampled_token_ids(self) -> torch.Tensor:
+        # [batch_size * num_speculative_tokens]
+        return self._sampled_token_ids[:self.batch_size]
+
+    @_wrap_func(enter="enable_attn_override", exit="disable_attn_override")
     def propose(
         self,
-        # [num_tokens]
-        target_token_ids: torch.Tensor,
-        # [num_tokens]
-        target_positions: torch.Tensor,
-        # [batch_size]
         next_token_ids: torch.Tensor,
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
@@ -149,22 +207,33 @@ class SSRProposer:
         # TODO(Yikang): Add them back if needed.
 
         # Determine the batch size and the number of tokens to compute.
-        if self.is_self_speculation:
-            num_tokens = next_token_ids.shape[0]
-            batch_size = next_token_ids.shape[0]
-            last_token_indices = self.arange[:batch_size]
-            self.input_ids[:batch_size] = next_token_ids
-        else:
-            raise NotImplementedError
+        num_tokens = next_token_ids.shape[0]
+        batch_size = next_token_ids.shape[0]
+        self.batch_size = batch_size
+        last_token_indices = self.arange[:batch_size]
+        self.input_ids[:batch_size] = next_token_ids
+
+        # FIXME: Lazy allocation of buffers. Not a good practice.
+        if self._draft_probs is None or \
+                self._draft_probs.shape[0] < batch_size:
+            self._draft_probs = torch.empty(
+                (batch_size, self.num_speculative_tokens, self.vocab_size),
+                dtype=torch.float32, device=self.device
+            )
+            self._sampled_token_ids = torch.empty(
+                (batch_size, self.num_speculative_tokens),
+                dtype=torch.float32, device=self.device
+            )
 
         # FIXME: need to consider multiple kv_cache_groups
-        attn_metadata: FlashAttentionMetadata | TreeAttentionMetadata = \
-            self.runner.attn_groups[0][0].metadata_builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=common_attn_metadata,
-            )
-        # At this moment, we assume all eagle layers belong to the same KV
+        attn_metadata = self.runner.attn_groups[0][0].metadata_builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
+        assert isinstance(attn_metadata, self.allowed_attn_types)
+        # At this moment, we assume all attention layers belong to the same KV
         # cache group, thus using the same attention metadata.
+        self.attn_metadata = attn_metadata
         per_layer_attn_metadata = {}
         for layer_name in self.attn_layer_names:
             per_layer_attn_metadata[layer_name] = attn_metadata
@@ -175,43 +244,38 @@ class SSRProposer:
             num_input_tokens = num_tokens
 
         # Update attention metadata and prepare inputs.
-        if self.is_self_speculation:
-            positions = attn_metadata.seq_lens.long()
-            # Mask out the position ids that exceed the max model length.
-            # Otherwise, we may get out-of-range error in RoPE.
-            exceeds_max_model_len = positions >= self.max_model_len
-            clamped_positions = torch.where(exceeds_max_model_len, 0,
-                                            positions)
-
-            attn_metadata.num_actual_tokens = num_tokens
-            attn_metadata.max_query_len = 1
-            attn_metadata.query_start_loc = self.arange[:batch_size + 1]
-            attn_metadata.max_seq_len += 1
-            attn_metadata.seq_lens += 1
-            # Consider max model length.
-            attn_metadata.max_seq_len = min(attn_metadata.max_seq_len,
-                                            self.max_model_len)
-            # For the requests that exceed the max model length, we set the
-            # sequence length to 1 to minimize their overheads in attention.
-            attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
-
-            # Compute the slot mapping.
-            block_numbers = clamped_positions // self.block_size
-            block_ids = attn_metadata.block_table.gather(
-                dim=1, index=block_numbers.view(-1, 1))
-            block_ids = block_ids.view(-1)
-            attn_metadata.slot_mapping = (block_ids * self.block_size +
-                                          clamped_positions % self.block_size)
-            # Mask out the slot mappings that exceed the max model length.
-            # Otherwise, the KV cache will be inadvertently updated with the
-            # padding tokens.
-            attn_metadata.slot_mapping.masked_fill_(exceeds_max_model_len,
-                                                    PADDING_SLOT_ID)
-            # copy inputs to buffer for cudagraph
-            self.positions[:batch_size] = clamped_positions
-            positions = self.positions[:num_input_tokens]
-        else:
-            raise NotImplementedError
+        positions = attn_metadata.seq_lens.long()
+        # Mask out the position ids that exceed the max model length.
+        # Otherwise, we may get out-of-range error in RoPE.
+        exceeds_max_model_len = positions >= self.max_model_len
+        clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
+        # Update the attention metadata.
+        attn_metadata.num_actual_tokens = num_tokens
+        attn_metadata.max_query_len = 1
+        attn_metadata.query_start_loc = self.arange[:batch_size + 1]
+        attn_metadata.max_seq_len += 1
+        attn_metadata.seq_lens += 1
+        # Consider max model length.
+        attn_metadata.max_seq_len = \
+            min(attn_metadata.max_seq_len, self.max_model_len)
+        # For the requests that exceed the max model length, we set the
+        # sequence length to 1 to minimize their overheads in attention.
+        attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
+        # Compute the slot mapping.
+        block_numbers = clamped_positions // self.block_size
+        block_ids = attn_metadata.block_table.gather(
+            dim=1, index=block_numbers.view(-1, 1))
+        block_ids = block_ids.view(-1)
+        attn_metadata.slot_mapping = \
+            (block_ids * self.block_size + clamped_positions % self.block_size)
+        # Mask out the slot mappings that exceed the max model length.
+        # Otherwise, the KV cache will be inadvertently updated with the
+        # padding tokens.
+        attn_metadata.slot_mapping.masked_fill_(
+            exceeds_max_model_len, PADDING_SLOT_ID)
+        # copy inputs to buffer for cudagraph
+        self.positions[:batch_size] = clamped_positions
+        positions = self.positions[:num_input_tokens]
 
         if self.is_multimodal_model:
             raise NotImplementedError
@@ -249,41 +313,75 @@ class SSRProposer:
             )
 
         hidden_states = hidden_states[last_token_indices]
-        logits: torch.Tensor = self.model.compute_logits(hidden_states, None)
-
-        if isinstance(attn_metadata, TreeAttentionMetadata):
-            raise NotImplementedError
-            # Draft using tree attention.
-            draft_token_ids_list = self.propose_tree(
-                batch_size=batch_size,
-                logits=logits,
-                positions=positions,
-                hidden_states=hidden_states,
-                common_attn_metadata=common_attn_metadata,
-            )
-            # [batch_size, num_tree_tokens]
-            return torch.cat(draft_token_ids_list, dim=1)
+        logits = self.model.compute_logits(hidden_states, None)
+        self._draft_probs[:batch_size, 0] = compute_probs(
+            logits, self.arange[1: batch_size + 1], sampling_metadata)
+        self._sampled_token_ids[:batch_size, 0] = \
+            self._sample(logits, sampling_metadata).sampled_token_ids.flatten()
 
         # Early exit if there is only one draft token to be generated.
-        if self.num_speculative_tokens == 1 or True:
-            # [batch_size, vocab_size]
-            self.draft_probs = \
-                compute_probs(
-                    logits,
-                    self.arange[1: batch_size + 1],
-                    sampling_metadata
+        if self.num_speculative_tokens == 1:
+            return self.sampled_token_ids
+
+        # Speculatively sample multiple tokens.
+        for step in range(1, self.num_speculative_tokens):
+            self.input_ids[:batch_size] = \
+                self._sampled_token_ids[:batch_size, step - 1]
+            self.positions[:batch_size] += 1
+
+            # Update attention metadata and prepare inputs.
+            # Mask out the position ids that exceed the max model length.
+            # Otherwise, we may get out-of-range error in RoPE.
+            positions = self.positions[:batch_size]
+            exceeds_max_model_len = positions >= self.max_model_len
+            positions = torch.where(exceeds_max_model_len, 0, positions)
+            # Update the attention metadata.
+            attn_metadata.max_seq_len += 1
+            attn_metadata.seq_lens += 1
+            # Consider max model length.
+            attn_metadata.max_seq_len = \
+                min(attn_metadata.max_seq_len, self.max_model_len)
+            # For the requests that exceed the max model length, we set the
+            # sequence length to 1 to minimize their overheads in attention.
+            attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
+            # Compute the slot mapping.
+            block_numbers = positions // self.block_size
+            block_ids = attn_metadata.block_table.gather(
+                dim=1, index=block_numbers.view(-1, 1))
+            block_ids = block_ids.view(-1)
+            attn_metadata.slot_mapping = \
+                (block_ids * self.block_size + positions % self.block_size)
+            # Mask out the slot mappings that exceed the max model length.
+            # Otherwise, the KV cache will be inadvertently updated with the
+            # padding tokens.
+            attn_metadata.slot_mapping.masked_fill_(
+                exceeds_max_model_len, PADDING_SLOT_ID)
+
+            # Run the model.
+            # Use persistent buffers for CUDA graphs.
+            with set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
+            ):
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    inputs_embeds=inputs_embeds,
                 )
-            sampler_output = self._sample(logits, sampling_metadata)
-            # [batch_size, 1]
-            return sampler_output.sampled_token_ids.view(batch_size, 1)
 
-        # TODO: Currently, MTP module released by deepseek only has
-        # one layer. Adapt this code to support multiple layers once
-        # there's a multi-layer MTP module.
-        assert isinstance(attn_metadata, self.allowed_attn_types)
+            # Get the logits and sample the next token.
+            hidden_states = hidden_states[last_token_indices]
+            logits = self.model.compute_logits(hidden_states, None)
+            self._draft_probs[:batch_size, step] = compute_probs(
+                logits, self.arange[1: batch_size + 1], sampling_metadata)
+            self._sampled_token_ids[:batch_size, step] = self._sample(
+                logits, sampling_metadata).sampled_token_ids.flatten()
 
-        # return draft_token_ids
-        assert False
+        # [batch_size, num_speculative_tokens]
+        return self.sampled_token_ids
 
     def prepare_inputs(
         self,
@@ -382,35 +480,21 @@ class SSRProposer:
         return spec_common_attn_metadata, token_indices
 
     def load_model(self, target_model: nn.Module) -> None:
-        # Check whether to use self-speculation or a separate draft model.
-        if self.vllm_config.speculative_config.model == \
-                self.vllm_config.model_config.model:
-            # Self-speculation.
-            self.model = target_model
-            self.attn_layer_names = set(
-                get_layers_from_vllm_config(self.vllm_config, Attention).keys()
-            )
-            self.is_self_speculation = True
-            # Reuse GPU buffers in runner.
-            self.input_ids = self.runner.input_ids.gpu
-            self.positions = self.runner.positions.gpu
-            return
+        # Load the target model.
+        self.model = target_model
+        self.attn_layer_names = set(
+            get_layers_from_vllm_config(self.vllm_config, Attention).keys())
+        # FIXME: LayerIndexer has strong assumptions on the layer names.
+        #        It may not work for some models.
+        self.layer_indexer = LayerIndexer(self.attn_layer_names)
 
-        # Use a separate draft model.
-        raise NotImplementedError
+        # Reuse runner buffers for inputs and positions.
+        # This is a MUST when using CUDA graphs.
+        self.input_ids = self.runner.input_ids.gpu
+        self.positions = self.runner.positions.gpu
 
-    @torch.inference_mode()
-    def dummy_run(
-        self,
-        num_tokens: int,
-    ) -> None:
-        with set_forward_context(None, self.vllm_config,
-                                 num_tokens=num_tokens):
-            input_ids = self.input_ids[:num_tokens]
-            inputs_embeds = None
-            self.model(
-                input_ids=input_ids,
-                positions=self.positions[:num_tokens],
-                hidden_states=self.hidden_states[:num_tokens],
-                inputs_embeds=inputs_embeds,
-            )
+        # Build the attention overrider.
+        self.attention_overrider = build_attention_overrider(
+            vllm_config=self.vllm_config,
+            device=self.device,
+        )

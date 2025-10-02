@@ -213,6 +213,11 @@ def rejection_sample(
         device,
     )
 
+    # if draft_probs is not None:
+    #     acc = 1.0 - 0.5 * (draft_probs - target_probs).abs().sum(dim=1)
+    #     torch.clamp_(acc, min=0.0, max=1.0)
+    #     print("Draft accuracy:", acc)
+
     # Rejection sampling for random sampling requests.
     rejection_random_sample_kernel[(batch_size, )](
         output_token_ids,
