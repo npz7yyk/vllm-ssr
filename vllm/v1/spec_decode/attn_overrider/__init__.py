@@ -5,7 +5,7 @@ from vllm.logger import init_logger
 
 type SSRConfig = dict
 METHOD_KEY = "kv_sparsity"
-RESERVED_KEYS = ["vllm_config", "device", "kv_caches"]
+RESERVED_KEYS = ["vllm_config", "device"]
 
 logger = init_logger(__name__)
 

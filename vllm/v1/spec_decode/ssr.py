@@ -235,14 +235,6 @@ class SSRProposer:
 
         if self.is_multimodal_model:
             raise NotImplementedError
-            input_ids = self.input_ids[:num_tokens]
-            inputs_embeds = self.model.get_input_embeddings(
-                input_ids,
-                multimodal_embeddings=mm_embeds or None,
-            )
-            self.inputs_embeds[:num_tokens] = inputs_embeds
-            inputs_embeds = self.inputs_embeds[:num_input_tokens]
-            input_ids = None
         else:
             inputs_embeds = None
             input_ids = self.input_ids[:num_input_tokens]
