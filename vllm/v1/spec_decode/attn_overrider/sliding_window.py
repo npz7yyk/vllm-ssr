@@ -29,9 +29,10 @@ class SlidingWindowAttentionOverrider(AbstractAttentionOverrider):
         )
 
     @override_return(use_private_attention)
-    def __call__(self, layer_index: int, *_args, **_kwargs):
+    def __call__(self, *_args, **_kwargs):
         # Since all attention layers share the same attn_metadata,
         # we only need to modify it for the first layer of the model.
+        layer_index = self._get_layer_index()
         if layer_index > 0:
             return
 

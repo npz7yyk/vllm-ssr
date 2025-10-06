@@ -4,7 +4,6 @@ from typing import Optional, Callable, TYPE_CHECKING
 
 import functools
 import numpy as np
-import re
 import torch
 import torch.nn as nn
 
@@ -46,47 +45,6 @@ def _wrap_func(enter: str = "", exit: str = "") -> Callable:
                     exit_fn()
         return wrapper
     return deco
-
-
-class LayerIndexer:
-    """A utility class to iterate over layer indices."""
-
-    def __init__(self, attn_layer_names: set[str]):
-        # Collect layer indices from layer names.
-        between_dots = re.compile(r'\.(\d+)\.')
-        any_digits = re.compile(r'\d+')
-        layer_indices = []
-        # Try to extract the layer index from the layer name.
-        for name in attn_layer_names:
-            # Try1: match digits between dots.
-            match = between_dots.search(name)
-            if match:
-                layer_indices.append(int(match.group(1)))
-                continue
-            # Try2: match any digits, take the first match.
-            match = any_digits.search(name)
-            if match:
-                layer_indices.append(int(match.group(0)))
-                continue
-            # Failed to parse the layer index.
-            layer_indices = list(range(len(attn_layer_names)))
-            logger.warning(
-                f"Failed to parse layer index from attention layer: {name}, "
-                f"Try fallback to use 0, 1, ..., {len(attn_layer_names) - 1}."
-            )
-            break
-
-        # Build the layer index iterator.
-        self._layer_indices = sorted(set(layer_indices))
-        self._num_layers = len(self._layer_indices)
-        self._current_pos = 0
-
-    @property
-    def current_layer_index(self) -> int:
-        # Return the current layer and move to the next one.
-        rst = self._layer_indices[self._current_pos]
-        self._current_pos = (self._current_pos + 1) % self._num_layers
-        return rst
 
 
 class SSRProposer:
@@ -162,11 +120,7 @@ class SSRProposer:
     def enable_attn_override(self):
         # Override function for attention to enable SSR.
         def overrided_attention(*args, **kwargs):
-            layer_index = self.layer_indexer.current_layer_index
-            use_private_attention = self.attention_overrider(
-                layer_index=layer_index,
-                *args, **kwargs
-            )
+            use_private_attention = self.attention_overrider(*args, **kwargs)
             # Attention already conducted inside the overrider.
             if use_private_attention:
                 return
@@ -486,9 +440,6 @@ class SSRProposer:
         self.model = target_model
         self.attn_layer_names = set(
             get_layers_from_vllm_config(self.vllm_config, Attention).keys())
-        # FIXME: LayerIndexer has strong assumptions on the layer names.
-        #        It may not work for some models.
-        self.layer_indexer = LayerIndexer(self.attn_layer_names)
 
         # Reuse runner buffers for inputs and positions.
         # This is a MUST when using CUDA graphs.
