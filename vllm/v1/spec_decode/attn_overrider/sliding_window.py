@@ -54,4 +54,4 @@ class SlidingWindowAttentionOverrider(AbstractAttentionOverrider):
             self.block_size, rounding_mode='floor'
         ).clamp_min_(0)
         attn_metadata.seq_lens -= extra_blocks * self.block_size
-        attn_metadata.max_seq_len = attn_metadata.seq_lens.max()
+        attn_metadata.max_seq_len = attn_metadata.seq_lens.max().item()

@@ -171,6 +171,8 @@ class SSRProposer:
             if use_private_attention:
                 return
             # The overrider only modifies the attention metadata.
+            # NOTE: max_seqlen_k (int) may be changed in the overrider.
+            kwargs["max_seqlen_k"] = self.attn_metadata.max_seq_len
             # Call the original attention function.
             self._original_func(*args, **kwargs)
 
