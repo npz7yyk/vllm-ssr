@@ -32,7 +32,7 @@ class SlidingWindowAttentionOverrider(AbstractAttentionOverrider):
     def __call__(self, *_args, **_kwargs):
         # Since all attention layers share the same attn_metadata,
         # we only need to modify it for the first layer of the model.
-        layer_index = self._get_layer_index()
+        layer_index, _ = self._get_layer()
         if layer_index > 0:
             return
 

@@ -6,10 +6,7 @@ import torch
 from vllm.attention.layer import Attention
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
-
-logger = init_logger(__name__)
 
 
 def override_return(always_value):
@@ -31,44 +28,42 @@ class LayerIndexer:
     """A utility class to iterate over layer indices."""
 
     def __init__(self, vllm_config: VllmConfig):
-        # Get attention layer names from the vllm config.
-        attn_layer_names = \
-            set(get_layers_from_vllm_config(vllm_config, Attention).keys())
+        # Get attention layers from the vllm config.
+        attn_layers = get_layers_from_vllm_config(vllm_config, Attention)
+
         # Collect layer indices from layer names.
         between_dots = re.compile(r'\.(\d+)\.')
         any_digits = re.compile(r'\d+')
-        layer_indices = []
+        layer_with_indices: list[tuple[int, Attention]] = []
         # Try to extract the layer index from the layer name.
-        for name in attn_layer_names:
+        for name, layer in attn_layers.items():
             # Try1: match digits between dots.
             match = between_dots.search(name)
             if match:
-                layer_indices.append(int(match.group(1)))
+                layer_with_indices.append((int(match.group(1)), layer))
                 continue
             # Try2: match any digits, take the first match.
             match = any_digits.search(name)
             if match:
-                layer_indices.append(int(match.group(0)))
+                layer_with_indices.append((int(match.group(0)), layer))
                 continue
             # Failed to parse the layer index.
-            layer_indices = list(range(len(attn_layer_names)))
-            logger.warning(
-                f"Failed to parse layer index from attention layer: {name}, "
-                f"Try fallback to use 0, 1, ..., {len(attn_layer_names) - 1}."
-            )
-            break
+            raise ValueError(f"Cannot parse layer index from layer {name}.")
 
         # Build the layer index iterator.
-        self._layer_indices = sorted(set(layer_indices))
-        self._num_layers = len(self._layer_indices)
+        self._layer_with_indices = sorted(layer_with_indices)
+        self._num_layers = len(self._layer_with_indices)
         self._current_pos = 0
 
     @property
-    def current_layer_index(self) -> int:
-        # Return the current layer and move to the next one.
-        rst = self._layer_indices[self._current_pos]
-        self._current_pos = (self._current_pos + 1) % self._num_layers
-        return rst
+    def current_layer(self) -> tuple[int, Attention]:
+        return self._layer_with_indices[self._current_pos]
+
+    def step(self):
+        if self._current_pos + 1 < self._num_layers:
+            self._current_pos += 1
+        else:
+            self._current_pos = 0
 
 
 class AbstractAttentionOverrider(abc.ABC):
@@ -86,13 +81,15 @@ class AbstractAttentionOverrider(abc.ABC):
         self.block_size = vllm_config.cache_config.block_size
         self.max_model_len = vllm_config.model_config.max_model_len
 
-    def _get_layer_index(self) -> int:
-        """Get the current layer index from the layer indexer.
+    def _get_layer(self) -> tuple[int, Attention]:
+        """Get the current layer index and object.
 
         Returns:
-            The current layer index.
+            The current layer index and object.
         """
-        return self.layer_indexer.current_layer_index
+        rst = self.layer_indexer.current_layer
+        self.layer_indexer.step()
+        return rst
 
     def _get_attn_metadata(self) -> FlashAttentionMetadata:
         """Get the attention metadata from the forward context.
