@@ -1,25 +1,12 @@
 import abc
-import functools
 import re
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.attention.layer import Attention
+from vllm.attention.ops.triton_unified_attention import unified_attention
 from vllm.config import VllmConfig, get_layers_from_vllm_config
-from vllm.forward_context import get_forward_context
-from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
-
-
-def override_return(always_value):
-    """
-    Wrap a function so its return value is always `always_value`.
-    """
-    def deco(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            fn(*args, **kwargs)
-            return always_value
-        return wrapper
-    return deco
+from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
 
 
 # FIXME: LayerIndexer has strong assumptions on the layer names.
@@ -55,6 +42,17 @@ class LayerIndexer:
         self._num_layers = len(self._layer_with_indices)
         self._current_pos = 0
 
+    def is_reset(self) -> bool:
+        return self._current_pos == 0
+
+    @property
+    def layers(self) -> list[Attention]:
+        return [layer for _, layer in self._layer_with_indices]
+
+    @property
+    def num_layers(self) -> int:
+        return self._num_layers
+
     @property
     def current_layer(self) -> tuple[int, Attention]:
         return self._layer_with_indices[self._current_pos]
@@ -74,12 +72,54 @@ class AbstractAttentionOverrider(abc.ABC):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        # Basic attributes.
         self.vllm_config = vllm_config
         self.device = device
         self.layer_indexer = LayerIndexer(vllm_config)
 
+        # Commonly used attributes.
         self.block_size = vllm_config.cache_config.block_size
         self.max_model_len = vllm_config.model_config.max_model_len
+
+        # Save original functions.
+        self.original_kv_insert_func = ops.reshape_and_cache_flash
+        self.original_attention_func = unified_attention
+
+        # Override the original kv insert function
+        def overrided_kv_insert(*args, **kwargs):
+            return self._overrided_kv_insert(*args, **kwargs)
+        import vllm.v1.attention.backends.triton_attn as triton_attn
+        triton_attn.ops.reshape_and_cache_flash = overrided_kv_insert
+
+        # Override the original attention function
+        def overrided_attention(*args, **kwargs):
+            return self._overrided_attention(*args, **kwargs)
+        for layer in self.layer_indexer.layers:
+            assert isinstance(layer.impl, TritonAttentionImpl)
+            layer.impl.unified_attention = overrided_attention
+
+        # Whether the overrider is in the draft phase.
+        self.in_draft = False
+        # The current speculative step.
+        self.current_draft_step = 0
+
+    @abc.abstractmethod
+    def _overrided_kv_insert(self):
+        # Switch implementations based on self.in_draft
+        pass
+
+    @abc.abstractmethod
+    def _overrided_attention(self):
+        # Switch implementations based on self.in_draft
+        pass
+
+    def enter_draft(self):
+        assert self.layer_indexer.is_reset()
+        self.in_draft = True
+
+    def exit_draft(self):
+        assert self.layer_indexer.is_reset()
+        self.in_draft = False
 
     def _get_layer(self) -> tuple[int, Attention]:
         """Get the current layer index and object.
@@ -90,15 +130,3 @@ class AbstractAttentionOverrider(abc.ABC):
         rst = self.layer_indexer.current_layer
         self.layer_indexer.step()
         return rst
-
-    def _get_attn_metadata(self) -> FlashAttentionMetadata:
-        """Get the attention metadata from the forward context.
-
-        Returns:
-            The attention metadata.
-        """
-        attn_metadata = get_forward_context().attn_metadata
-        # Assume: All attention layers share the same attn_metadata.
-        if isinstance(attn_metadata, dict):
-            attn_metadata = list(attn_metadata.values())[0]
-        return attn_metadata

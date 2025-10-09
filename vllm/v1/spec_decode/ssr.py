@@ -8,13 +8,12 @@ import torch
 import torch.nn as nn
 
 from vllm.attention.layer import Attention
-from vllm.attention.utils.fa_utils import is_flash_attn_varlen_func_available
 from vllm.config import (CompilationLevel, VllmConfig,
                          get_layers_from_vllm_config)
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.utils import is_pin_memory_available
-from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -100,12 +99,7 @@ class SSRProposer:
         self._sampled_token_ids = None
 
         # Determine allowed attention backends once during initialization.
-        self.allowed_attn_types = (FlashAttentionMetadata,)
-        import vllm.v1.attention.backends.flash_attn as flash_attn_module
-        self.flash_attn_module = flash_attn_module
-        assert is_flash_attn_varlen_func_available(), \
-            "FlashAttention with variable length support is required for SSR."
-        self._original_func = None
+        self.allowed_attn_types = (TritonAttentionMetadata,)
 
     def _sample(
         self,
@@ -117,41 +111,52 @@ class SSRProposer:
         """
         return self.runner.sampler(logits, sampling_metadata)
 
-    def enable_attn_override(self):
-        # Override function for attention to enable SSR.
-        def overrided_attention(*args, **kwargs):
-            use_private_attention = self.attention_overrider(*args, **kwargs)
-            # Attention already conducted inside the overrider.
-            if use_private_attention:
-                return
-            # The overrider only modifies the attention metadata.
-            # NOTE: max_seqlen_k (int) may be changed in the overrider.
-            kwargs["max_seqlen_k"] = self.attn_metadata.max_seq_len
-            # Call the original attention function.
-            self._original_func(*args, **kwargs)
+    def enter_draft(self):
+        self.attention_overrider.enter_draft()
 
-        # Save the original function for the first time.
-        if self._original_func is None:
-            self._original_func = self.flash_attn_module.flash_attn_varlen_func
-        # Override the function.
-        self.flash_attn_module.flash_attn_varlen_func = overrided_attention
+    def exit_draft(self):
+        self.attention_overrider.exit_draft()
 
-    def disable_attn_override(self):
-        # Restore the original function.
-        self.flash_attn_module.flash_attn_varlen_func = self._original_func
+    def remap_prev_draft_probs(self, num_draft_tokens: np.ndarray):
+        # Major computation is conducted on CPU.
+        # Will be conducted in the runner's CPU logic region.
+        req_id_to_index = self.runner.input_batch.req_id_to_index
+        prev_req_id_to_index = self.req_id_to_index
 
-    def get_draft_probs(self, running_req_mask: torch.Tensor) -> torch.Tensor:
-        # [batch_size * num_speculative_tokens, vocab_size]
-        running_req_mask = running_req_mask[:self.batch_size]
-        return self._draft_probs[:self.batch_size][running_req_mask]. \
-            reshape(-1, self.vocab_size)
+        # Skip remmapping if possible.
+        if all(n == self.num_speculative_tokens for n in num_draft_tokens) \
+                and req_id_to_index == prev_req_id_to_index:
+            self.cu_gather_indices = None
+
+        # Number of requests is small, so we use a simple loop here.
+        index_to_req_id = {v: k for k, v in req_id_to_index.items()}
+        gather_indices = []
+        for idx, count in enumerate(num_draft_tokens):
+            req_id = index_to_req_id[idx]
+            # Nothing to gather for this request.
+            if count == 0:
+                continue
+            assert req_id in prev_req_id_to_index
+            start = prev_req_id_to_index[req_id] * self.vllm_config.\
+                speculative_config.num_speculative_tokens
+            end = start + count
+            gather_indices += list(range(start, end))
+        self.cu_gather_indices = torch.tensor(
+            gather_indices, pin_memory=self.runner.pin_memory
+        ).to(self.device, non_blocking=True)
+
+    @property
+    def draft_probs(self) -> torch.Tensor:
+        buffer = self._draft_probs[:self.batch_size].view(-1, self.vocab_size)
+        return buffer if self.cu_gather_indices is None else \
+            buffer.index_select(0, self.cu_gather_indices)
 
     @property
     def sampled_token_ids(self) -> torch.Tensor:
         # [batch_size * num_speculative_tokens]
         return self._sampled_token_ids[:self.batch_size]
 
-    @_wrap_func(enter="enable_attn_override", exit="disable_attn_override")
+    @_wrap_func(enter="enter_draft", exit="exit_draft")
     def propose(
         self,
         next_token_ids: torch.Tensor,
@@ -166,6 +171,7 @@ class SSRProposer:
         num_tokens = next_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
         self.batch_size = batch_size
+        self.req_id_to_index = dict(self.runner.input_batch.req_id_to_index)
         last_token_indices = self.arange[:batch_size]
         self.input_ids[:batch_size] = next_token_ids
 
@@ -247,6 +253,7 @@ class SSRProposer:
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        self.attention_overrider.current_draft_step = 1
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -307,6 +314,7 @@ class SSRProposer:
 
             # Run the model.
             # Use persistent buffers for CUDA graphs.
+            self.attention_overrider.current_draft_step = step + 1
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,

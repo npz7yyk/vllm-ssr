@@ -276,9 +276,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
-        # Running request mask used to mask out finished requests
-        self.running_req_mask = \
-            self._make_buffer(self.max_num_reqs, dtype=torch.bool)
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -515,16 +512,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
-        # Remove finished requests from the draft probabilities of SSR.
-        if self.speculative_config and self.speculative_config.method == "ssr":
-            num_reqs = self.input_batch.num_reqs
-            if scheduler_output.finished_req_ids:
-                for id, idx in self.input_batch.req_id_to_index.items():
-                    if id in scheduler_output.finished_req_ids:
-                        self.running_req_mask.np[idx] = False
-            else:
-                self.running_req_mask.np[:num_reqs].fill(True)
-            self.running_req_mask.copy_to_gpu(num_reqs)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1003,6 +990,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     scheduler_output.scheduled_spec_decode_tokens.items()):
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 num_draft_tokens[req_idx] = len(draft_token_ids)
+
+            # SSR maintains draft_probs, need to remap
+            if self.speculative_config.method == "ssr":
+                self.drafter.remap_prev_draft_probs(num_draft_tokens)
 
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens)
@@ -1881,7 +1872,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 spec_decode_metadata,
                 # NOTE(Yikang): REAL rejection sampling needs draft_probs!
                 # Need to mask out finished requests.
-                self.drafter.get_draft_probs(self.running_req_mask.gpu)
+                self.drafter.draft_probs
                 if isinstance(self.drafter, SSRProposer) else None,
                 target_logits,
                 bonus_token_ids,
