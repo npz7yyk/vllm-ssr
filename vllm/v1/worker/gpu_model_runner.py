@@ -2349,9 +2349,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.drafter.prepare_inputs(
                         common_attn_metadata, num_rejected_tokens_cpu)
 
-                target_token_ids = self.input_ids.gpu[token_indices]
-                # TODO(woosuk): Support M-RoPE.
-                target_positions = self.positions.gpu[token_indices]
             mm_embeds = None
             if self.supports_mm_inputs:
                 mm_embeds = self._gather_mm_embeddings(scheduler_output,

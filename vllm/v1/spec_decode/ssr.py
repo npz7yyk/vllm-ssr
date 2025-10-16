@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Optional, Callable, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
-import functools
 import numpy as np
 import torch
 import torch.nn as nn
@@ -25,25 +24,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 PADDING_SLOT_ID = -1
-
-
-def _wrap_func(enter: str = "", exit: str = "") -> Callable:
-    def deco(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            inst = args[0] if args else None
-            enter_fn = getattr(inst, enter) if enter else lambda: None
-            exit_fn = getattr(inst, exit) if exit else lambda: None
-
-            if enter_fn:
-                enter_fn()
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                if exit_fn:
-                    exit_fn()
-        return wrapper
-    return deco
 
 
 class SSRProposer:
@@ -111,12 +91,6 @@ class SSRProposer:
         """
         return self.runner.sampler(logits, sampling_metadata)
 
-    def enter_draft(self):
-        self.attention_overrider.enter_draft()
-
-    def exit_draft(self):
-        self.attention_overrider.exit_draft()
-
     def remap_prev_draft_probs(self, num_draft_tokens: np.ndarray):
         # Major computation is conducted on CPU.
         # Will be conducted in the runner's CPU logic region.
@@ -156,7 +130,6 @@ class SSRProposer:
         # [batch_size * num_speculative_tokens]
         return self._sampled_token_ids[:self.batch_size]
 
-    @_wrap_func(enter="enter_draft", exit="exit_draft")
     def propose(
         self,
         next_token_ids: torch.Tensor,
@@ -193,6 +166,11 @@ class SSRProposer:
             common_attn_metadata=common_attn_metadata,
         )
         assert isinstance(attn_metadata, self.allowed_attn_types)
+
+        # Do not draft if the attention overrider is not ready.
+        if not self.attention_overrider.ready_to_draft():
+            return None
+
         # At this moment, we assume all attention layers belong to the same KV
         # cache group, thus using the same attention metadata.
         self.attn_metadata = attn_metadata
@@ -253,7 +231,7 @@ class SSRProposer:
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        self.attention_overrider.current_draft_step = 1
+        self.attention_overrider.set_draft_step(1)
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -276,6 +254,7 @@ class SSRProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
+            self.attention_overrider.set_draft_step(0)
             return self.sampled_token_ids
 
         # Speculatively sample multiple tokens.
@@ -314,7 +293,7 @@ class SSRProposer:
 
             # Run the model.
             # Use persistent buffers for CUDA graphs.
-            self.attention_overrider.current_draft_step = step + 1
+            self.attention_overrider.set_draft_step(step + 1)
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -337,6 +316,7 @@ class SSRProposer:
                 logits, sampling_metadata).sampled_token_ids.flatten()
 
         # [batch_size, num_speculative_tokens]
+        self.attention_overrider.set_draft_step(0)
         return self.sampled_token_ids
 
     def prepare_inputs(

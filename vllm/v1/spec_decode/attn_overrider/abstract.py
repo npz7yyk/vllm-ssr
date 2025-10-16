@@ -98,9 +98,8 @@ class AbstractAttentionOverrider(abc.ABC):
             assert isinstance(layer.impl, TritonAttentionImpl)
             layer.impl.unified_attention = overrided_attention
 
-        # Whether the overrider is in the draft phase.
-        self.in_draft = False
         # The current speculative step.
+        # 0 means target verification.
         self.current_draft_step = 0
 
     @abc.abstractmethod
@@ -113,13 +112,16 @@ class AbstractAttentionOverrider(abc.ABC):
         # Switch implementations based on self.in_draft
         pass
 
-    def enter_draft(self):
-        assert self.layer_indexer.is_reset()
-        self.in_draft = True
+    def ready_to_draft(self):
+        return True
 
-    def exit_draft(self):
+    @property
+    def in_draft(self) -> bool:
+        return self.current_draft_step > 0
+
+    def set_draft_step(self, step: int):
         assert self.layer_indexer.is_reset()
-        self.in_draft = False
+        self.current_draft_step = step
 
     def _get_layer(self) -> tuple[int, Attention]:
         """Get the current layer index and object.
