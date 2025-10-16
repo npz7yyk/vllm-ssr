@@ -277,6 +277,7 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
                 # Determine how many new indices to add for each sequence.
                 self.num_accepted_tokens: torch.Tensor = \
                     seqused_k - self.context_lens[:self.batch_size] - 1
+                self.num_accepted_tokens.clamp_min_(0)
                 self.cache_leftpad: torch.Tensor = \
                     self.topk - self.context_lens[:self.batch_size] - \
                     self.num_accepted_tokens
@@ -325,8 +326,10 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
 
         # Allocate the top-k slots.
         self.topk_seq_indices = [torch.empty(
-            (batch_size, self.topk), dtype=torch.int32, device=self.device
+            (batch_size, self.topk), dtype=torch.long, device=self.device
         ) for _ in range(self.num_layers)]
+        self.topk_scores_dummy = torch.empty(
+            (batch_size, self.topk), dtype=torch.float32, device=self.device)
 
         # Allocate the top-k KV caches.
         self.topk_k_caches = [torch.empty(
@@ -373,9 +376,11 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
             attn_scores.fill_(-torch.inf)
             topk_seq_indices = self.topk_seq_indices[self.layer_index]
             topk_seq_indices = topk_seq_indices[:self.batch_size]
+            topk_scores_dummy = self.topk_scores_dummy[:self.batch_size]
             ssr_unified_attention(
                 *args, **kwargs,
                 topk=self.topk,
                 attn_scores=attn_scores,
                 topk_seq_indices=topk_seq_indices,
+                topk_scores_dummy=topk_scores_dummy,
             )

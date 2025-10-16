@@ -877,6 +877,7 @@ def ssr_unified_attention(
     topk=None,
     attn_scores=None,
     topk_seq_indices=None,
+    topk_scores_dummy=None,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -1079,14 +1080,14 @@ def ssr_unified_attention(
     uniform_decode = max_seqlen_q * num_seqs == cu_seqlens_q[-1]
     if uniform_decode:
         attn_scores = attn_scores.view(num_seqs, -1, focus_len)
-        attn_scores_reduced = attn_scores.sum(dim=1)
+        attn_scores_reduced = attn_scores.sum(dim=1, dtype=torch.float32)
     else:
         # Non-uniform decode
         # We need to create a mask for topk selection
         # (batch_size, num_query_heads, focus_len)
         attn_scores_reduced = torch.empty(
             (num_seqs, focus_len),
-            dtype=attn_scores.dtype,
+            dtype=torch.float32,
             device=attn_scores.device,
         )
         sum_reduce_with_masking(
@@ -1098,7 +1099,7 @@ def ssr_unified_attention(
         )
 
     # Compute topk indices and copy to output
-    _, topk_indices = \
-        torch.topk(attn_scores_reduced, topk, -1, largest=True, sorted=True)
-    # topk_indices: (num_seqs, topk)
-    topk_seq_indices.copy_(topk_indices)
+    torch.topk(
+        attn_scores_reduced, topk, -1, largest=True, sorted=True,
+        out=(topk_scores_dummy, topk_seq_indices)
+    )
