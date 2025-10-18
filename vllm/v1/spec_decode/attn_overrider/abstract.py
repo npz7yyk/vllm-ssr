@@ -86,29 +86,29 @@ class AbstractAttentionOverrider(abc.ABC):
         self.original_attention_func = unified_attention
 
         # Override the original kv insert function
-        def overrided_kv_insert(*args, **kwargs):
-            return self._overrided_kv_insert(*args, **kwargs)
+        def overriden_kv_insert(*args, **kwargs):
+            return self._overriden_kv_insert(*args, **kwargs)
         import vllm.v1.attention.backends.triton_attn as triton_attn
-        triton_attn.ops.reshape_and_cache_flash = overrided_kv_insert
+        triton_attn.ops.reshape_and_cache_flash = overriden_kv_insert
 
         # Override the original attention function
-        def overrided_attention(*args, **kwargs):
-            return self._overrided_attention(*args, **kwargs)
+        def overriden_attention(*args, **kwargs):
+            return self._overriden_attention(*args, **kwargs)
         for layer in self.layer_indexer.layers:
             assert isinstance(layer.impl, TritonAttentionImpl)
-            layer.impl.unified_attention = overrided_attention
+            layer.impl.unified_attention = overriden_attention
 
         # The current speculative step.
         # 0 means target verification.
         self.current_draft_step = 0
 
     @abc.abstractmethod
-    def _overrided_kv_insert(self):
+    def _overriden_kv_insert(self):
         # Switch implementations based on self.in_draft
         pass
 
     @abc.abstractmethod
-    def _overrided_attention(self):
+    def _overriden_attention(self):
         # Switch implementations based on self.in_draft
         pass
 

@@ -363,7 +363,7 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
         self.last_k = key[:self.batch_size]
         self.last_v = value[:self.batch_size]
 
-    def _overrided_kv_insert(self, *args, **kwargs):
+    def _overriden_kv_insert(self, *args, **kwargs):
         # Get the current layer index.
         self.layer_index, _ = self._get_layer()
 
@@ -487,7 +487,7 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
             dtype=self.vllm_config.model_config.dtype, device=self.device)
             for _ in range(self.num_layers)]
 
-    def _overrided_attention(self, *args, **kwargs):
+    def _overriden_attention(self, *args, **kwargs):
         # Determine whether to enable topk attention.
         if not self.in_draft and self.layer_index == 0:
             seqlens: torch.Tensor = kwargs['seqused_k']

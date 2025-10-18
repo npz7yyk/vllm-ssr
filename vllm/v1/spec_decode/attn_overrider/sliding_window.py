@@ -29,11 +29,11 @@ class SlidingWindowAttentionOverrider(AbstractAttentionOverrider):
             dtype=torch.int32, device=device
         )
 
-    def _overrided_kv_insert(self, *args, **kwargs):
+    def _overriden_kv_insert(self, *args, **kwargs):
         # Always use the original kv insert function.
         return self.original_kv_insert_func(*args, **kwargs)
 
-    def _overrided_attention(self, *args, **kwargs):
+    def _overriden_attention(self, *args, **kwargs):
         # If not in draft phase, use the original attention function.
         if not self.in_draft:
             return self.original_attention_func(*args, **kwargs)
