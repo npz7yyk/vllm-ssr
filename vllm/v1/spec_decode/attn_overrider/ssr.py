@@ -428,7 +428,8 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
 
             # Gather the top-k KV from the full cache.
             # Need to be done for all layers, but only in the first step.
-            topk_seq_indices = self.topk_seq_indices[layer_index]
+            topk_seq_indices = \
+                self.topk_seq_indices[layer_index][:self.batch_size]
 
             # Gather the top-k KV from the full kv cache.
             # They will be reused in the next few speculative steps.
