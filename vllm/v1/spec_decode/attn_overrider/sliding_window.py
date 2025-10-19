@@ -1,7 +1,7 @@
 import torch
 
 from vllm.config import VllmConfig
-from .abstract import AbstractAttentionOverrider
+from .abstract import AbstractAttentionOverrider, is_sliding_window_layer
 
 
 class SlidingWindowAttentionOverrider(AbstractAttentionOverrider):
@@ -58,10 +58,14 @@ class SlidingWindowAttentionOverrider(AbstractAttentionOverrider):
 
         # Since all attention layers share the same attn_metadata,
         # we only need to modify it for the first layer of the model.
-        layer_index, _ = self._get_layer()
+        layer_index, layer = self._get_layer()
+
+        # If this layer is sliding window attention, use original attention.
+        if is_sliding_window_layer(layer):
+            return self.original_attention_func(*args, **kwargs)
 
         # Modify the attn_metadata for sliding window attention.
-        if layer_index == 0:
+        if layer_index == self.min_effective_layer_index:
             # Get the necessary arguments.
             seq_lens: torch.Tensor = kwargs['seqused_k']
             block_table: torch.Tensor = kwargs['block_table']

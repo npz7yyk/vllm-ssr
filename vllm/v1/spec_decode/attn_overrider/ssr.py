@@ -5,7 +5,7 @@ import triton.language as tl
 from vllm.attention.ops.triton_ssr_attention import ssr_unified_attention
 from vllm.config import VllmConfig
 from vllm.vllm_flash_attn import flash_attn_with_kvcache
-from .abstract import AbstractAttentionOverrider
+from .abstract import AbstractAttentionOverrider, is_sliding_window_layer
 
 
 @triton.jit
@@ -365,10 +365,11 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
 
     def _overriden_kv_insert(self, *args, **kwargs):
         # Get the current layer index.
-        self.layer_index, _ = self._get_layer()
+        self.layer_index, layer = self._get_layer()
+        self.is_effective_layer = not is_sliding_window_layer(layer)
 
         # Determine whether to insert into the topk cache.
-        if self.enable_topk and self.in_draft:
+        if self.enable_topk and self.in_draft and self.is_effective_layer:
             # Insert into the topk cache.
             self._draft_kv_insert(*args, **kwargs)
         else:
@@ -407,16 +408,13 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
         alibi_slopes=None,
         *_args, **_kwargs
     ) -> bool:
-        # Ensure top-k attention is enabled.
-        assert self.enable_topk
-
         # Get the current layer index.
         layer_index = self.layer_index
 
         # Build the top-k kv cache for the next few speculative steps.
         if self.current_draft_step == 1:
             # Things to do only once in the first speculative step.
-            if layer_index == 0:
+            if layer_index == self.min_effective_layer_index:
                 # Determine how many new indices to add for each sequence.
                 self.num_accepted_tokens: torch.Tensor = \
                     seqused_k - self.context_lens[:self.batch_size] - 1
@@ -459,7 +457,7 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
         # Do nothing if already allocated and the batch size is sufficient.
         batch_size = self.batch_size
         if len(self.topk_seq_indices) and \
-                self.topk_seq_indices[0].shape[0] >= batch_size:
+                self.topk_scores_dummy.shape[0] >= batch_size:
             return
 
         # Allocate the attention score buffer, shared by all layers.
@@ -470,8 +468,9 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
 
         # Allocate the top-k slots.
         self.topk_seq_indices = [torch.empty(
-            (batch_size, self.topk), dtype=torch.long, device=self.device
-        ) for _ in range(self.num_layers)]
+            (batch_size, self.topk), dtype=torch.long, device=self.device)
+            if idx in self.effective_layer_indices else None
+            for idx in range(self.num_layers)]
         self.topk_scores_dummy = torch.empty(
             (batch_size, self.topk), dtype=torch.float32, device=self.device)
 
@@ -480,40 +479,44 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
             (batch_size, self.topk + self.num_speculative_tokens,
              self.num_kv_heads, self.head_dim),
             dtype=self.vllm_config.model_config.dtype, device=self.device)
-            for _ in range(self.num_layers)]
+            if idx in self.effective_layer_indices else None
+            for idx in range(self.num_layers)]
         self.topk_v_caches = [torch.empty(
             (batch_size, self.topk + self.num_speculative_tokens,
              self.num_kv_heads, self.head_dim),
             dtype=self.vllm_config.model_config.dtype, device=self.device)
-            for _ in range(self.num_layers)]
+            if idx in self.effective_layer_indices else None
+            for idx in range(self.num_layers)]
 
     def _overriden_attention(self, *args, **kwargs):
         # Determine whether to enable topk attention.
         if not self.in_draft and self.layer_index == 0:
+            max_seqlen_q: int = kwargs['max_seqlen_q']
+            self.enable_topk = max_seqlen_q <= self.num_speculative_tokens + 1
+
+        # Upddate metadata at the first effective layer.
+        if self.enable_topk and not self.in_draft and \
+                self.layer_index == self.min_effective_layer_index:
             seqlens: torch.Tensor = kwargs['seqused_k']
             cu_seqlens_q: torch.Tensor = kwargs['cu_seqlens_q']
             self.batch_size = seqlens.shape[0]
             self.block_table = kwargs['block_table'][:self.batch_size]
             self.max_seqlen_q: int = kwargs['max_seqlen_q']
-            self.enable_topk = \
-                self.max_seqlen_q <= self.num_speculative_tokens + 1
-
-            if self.enable_topk:
-                # Register number of query tokens.
-                self.num_query_tokens = self.batch_size * self.max_seqlen_q
-                # Allocate memory if needed.
-                self._may_allocate_topk_mem()
-                # Track the context lengths for each sequence.
-                # Ultimate goal is to determine top-k slots for each sequence.
-                seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-                self.context_lens[:self.batch_size] = seqlens - seqlens_q + 1
-                # Check whether it is uniform decode.
-                self.uniform_decode = \
-                    self.max_seqlen_q * self.batch_size == cu_seqlens_q[-1]
+            # Register number of query tokens.
+            self.num_query_tokens = self.batch_size * self.max_seqlen_q
+            # Allocate memory if needed.
+            self._may_allocate_topk_mem()
+            # Track the context lengths for each sequence.
+            # Ultimate goal is to determine top-k slots for each sequence.
+            seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            self.context_lens[:self.batch_size] = seqlens - seqlens_q + 1
+            # Check whether it is uniform decode.
+            self.uniform_decode = \
+                self.max_seqlen_q * self.batch_size == cu_seqlens_q[-1]
 
         # Determine which attention function to use.
         # If not using top-k, fall back to the original attention function.
-        if not self.enable_topk:
+        if not self.enable_topk or not self.is_effective_layer:
             self.original_attention_func(*args, **kwargs)
             return
 

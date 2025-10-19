@@ -6,9 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.attention.layer import Attention
-from vllm.config import (CompilationLevel, VllmConfig,
-                         get_layers_from_vllm_config)
+from vllm.config import CompilationLevel, VllmConfig
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.utils import is_pin_memory_available
@@ -127,18 +125,21 @@ class SSRProposer:
 
     @property
     def sampled_token_ids(self) -> torch.Tensor:
-        # [batch_size * num_speculative_tokens]
         return self._sampled_token_ids[:self.batch_size]
 
     def propose(
         self,
         next_token_ids: torch.Tensor,
-        common_attn_metadata: CommonAttentionMetadata,
+        common_attn_metadata: dict[int, CommonAttentionMetadata],
         sampling_metadata: SamplingMetadata,
         mm_embeds: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
         # For prototyping, mm, dp, pp, and kv_connector etc. are not supported.
         # TODO(Yikang): Add them back if needed.
+
+        # Do not draft if the attention overrider is not ready.
+        if not self.attention_overrider.ready_to_draft():
+            return None
 
         # Determine the batch size and the number of tokens to compute.
         num_tokens = next_token_ids.shape[0]
@@ -160,23 +161,24 @@ class SSRProposer:
                 dtype=torch.float32, device=self.device
             )
 
-        # FIXME: need to consider multiple kv_cache_groups
-        attn_metadata = self.runner.attn_groups[0][0].metadata_builder.build(
-            common_prefix_len=0,
-            common_attn_metadata=common_attn_metadata,
-        )
-        assert isinstance(attn_metadata, self.allowed_attn_types)
-
-        # Do not draft if the attention overrider is not ready.
-        if not self.attention_overrider.ready_to_draft():
-            return None
-
-        # At this moment, we assume all attention layers belong to the same KV
-        # cache group, thus using the same attention metadata.
-        self.attn_metadata = attn_metadata
+        # Build attention metadata for all attention groups.
+        attn_metadatas: list[TritonAttentionMetadata] = []
         per_layer_attn_metadata = {}
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
+        for kv_cache_group_id, attn_metadata in common_attn_metadata.items():
+            # FIXME: Now assume each kv cache group only has one attn group.
+            attn_group = self.runner.attn_groups[kv_cache_group_id][0]
+            # Build attention metadata for this attn group.
+            attn_metadata = attn_group.metadata_builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=attn_metadata,
+            )
+            assert isinstance(attn_metadata, self.allowed_attn_types)
+            attn_metadatas.append(attn_metadata)
+            # Register per-layer attention metadata.
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
+
+        # Determine the number of input tokens for cudagraph.
         if self.use_cuda_graph and \
                 num_tokens <= self.cudagraph_batch_sizes[-1]:
             num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
@@ -189,33 +191,34 @@ class SSRProposer:
         # Otherwise, we may get out-of-range error in RoPE.
         exceeds_max_model_len = positions >= self.max_model_len
         clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
-        # Update the attention metadata.
-        attn_metadata.num_actual_tokens = num_tokens
-        attn_metadata.max_query_len = 1
-        attn_metadata.query_start_loc = self.arange[:batch_size + 1]
-        attn_metadata.max_seq_len += 1
-        attn_metadata.seq_lens += 1
-        # Consider max model length.
-        attn_metadata.max_seq_len = \
-            min(attn_metadata.max_seq_len, self.max_model_len)
-        # For the requests that exceed the max model length, we set the
-        # sequence length to 1 to minimize their overheads in attention.
-        attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
-        # Compute the slot mapping.
-        block_numbers = clamped_positions // self.block_size
-        block_ids = attn_metadata.block_table.gather(
-            dim=1, index=block_numbers.view(-1, 1))
-        block_ids = block_ids.view(-1)
-        attn_metadata.slot_mapping = \
-            (block_ids * self.block_size + clamped_positions % self.block_size)
-        # Mask out the slot mappings that exceed the max model length.
-        # Otherwise, the KV cache will be inadvertently updated with the
-        # padding tokens.
-        attn_metadata.slot_mapping.masked_fill_(
-            exceeds_max_model_len, PADDING_SLOT_ID)
-        # copy inputs to buffer for cudagraph
         self.positions[:batch_size] = clamped_positions
         positions = self.positions[:num_input_tokens]
+
+        # Update the attention metadata.
+        for attn_metadata in attn_metadatas:
+            attn_metadata.num_actual_tokens = num_tokens
+            attn_metadata.max_query_len = 1
+            attn_metadata.query_start_loc = self.arange[:batch_size + 1]
+            attn_metadata.max_seq_len += 1
+            attn_metadata.seq_lens += 1
+            # Consider max model length.
+            attn_metadata.max_seq_len = \
+                min(attn_metadata.max_seq_len, self.max_model_len)
+            # For the requests that exceed the max model length, we set the
+            # sequence length to 1 to minimize their overheads in attention.
+            attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
+            # Compute the slot mapping.
+            block_numbers = clamped_positions // self.block_size
+            block_ids = attn_metadata.block_table.gather(
+                dim=1, index=block_numbers.view(-1, 1))
+            block_ids = block_ids.view(-1)
+            attn_metadata.slot_mapping = (block_ids * self.block_size +
+                                          clamped_positions % self.block_size)
+            # Mask out the slot mappings that exceed the max model length.
+            # Otherwise, the KV cache will be inadvertently updated with the
+            # padding tokens.
+            attn_metadata.slot_mapping.masked_fill_(
+                exceeds_max_model_len, PADDING_SLOT_ID)
 
         if self.is_multimodal_model:
             raise NotImplementedError
@@ -269,27 +272,29 @@ class SSRProposer:
             positions = self.positions[:batch_size]
             exceeds_max_model_len = positions >= self.max_model_len
             positions = torch.where(exceeds_max_model_len, 0, positions)
+
             # Update the attention metadata.
-            attn_metadata.max_seq_len += 1
-            attn_metadata.seq_lens += 1
-            # Consider max model length.
-            attn_metadata.max_seq_len = \
-                min(attn_metadata.max_seq_len, self.max_model_len)
-            # For the requests that exceed the max model length, we set the
-            # sequence length to 1 to minimize their overheads in attention.
-            attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
-            # Compute the slot mapping.
-            block_numbers = positions // self.block_size
-            block_ids = attn_metadata.block_table.gather(
-                dim=1, index=block_numbers.view(-1, 1))
-            block_ids = block_ids.view(-1)
-            attn_metadata.slot_mapping = \
-                (block_ids * self.block_size + positions % self.block_size)
-            # Mask out the slot mappings that exceed the max model length.
-            # Otherwise, the KV cache will be inadvertently updated with the
-            # padding tokens.
-            attn_metadata.slot_mapping.masked_fill_(
-                exceeds_max_model_len, PADDING_SLOT_ID)
+            for attn_metadata in attn_metadatas:
+                attn_metadata.max_seq_len += 1
+                attn_metadata.seq_lens += 1
+                # Consider max model length.
+                attn_metadata.max_seq_len = \
+                    min(attn_metadata.max_seq_len, self.max_model_len)
+                # For the requests that exceed the max model length, we set the
+                # sequence length to 1 to minimize the overheads in attention.
+                attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
+                # Compute the slot mapping.
+                block_numbers = positions // self.block_size
+                block_ids = attn_metadata.block_table.gather(
+                    dim=1, index=block_numbers.view(-1, 1))
+                block_ids = block_ids.view(-1)
+                attn_metadata.slot_mapping = \
+                    (block_ids * self.block_size + positions % self.block_size)
+                # Mask out the slot mappings that exceed the max model length.
+                # Otherwise, the KV cache will be inadvertently updated with
+                # the padding tokens.
+                attn_metadata.slot_mapping.masked_fill_(
+                    exceeds_max_model_len, PADDING_SLOT_ID)
 
             # Run the model.
             # Use persistent buffers for CUDA graphs.
@@ -324,12 +329,11 @@ class SSRProposer:
         common_attn_metadata: CommonAttentionMetadata,
         # [batch_size]
         num_rejected_tokens: torch.Tensor
-    ) -> tuple[CommonAttentionMetadata, torch.Tensor]:
+    ) -> CommonAttentionMetadata:
         """
         This function is used to prepare the inputs for the spec decode.
         It updates to the common_attn_metadata to account for the rejected
-        tokens (and newly sampled tokens). It also returns the token indices
-        of the tokens that should be fed to the speculator.
+        tokens (and newly sampled tokens).
         """
         # E.g.
         #  common_attn_metadata.query_start_loc{_cpu}:
@@ -396,7 +400,7 @@ class SSRProposer:
         token_indices = torch.from_numpy(token_indices_np).to(
             device, non_blocking=True)
 
-        spec_common_attn_metadata = CommonAttentionMetadata(
+        return CommonAttentionMetadata(
             query_start_loc=new_query_start_loc_cpu.to(device,
                                                        non_blocking=True),
             seq_lens=new_seq_lens_cpu.to(device, non_blocking=True),
@@ -413,13 +417,9 @@ class SSRProposer:
             causal=True,
         )
 
-        return spec_common_attn_metadata, token_indices
-
     def load_model(self, target_model: nn.Module) -> None:
         # Load the target model.
         self.model = target_model
-        self.attn_layer_names = set(
-            get_layers_from_vllm_config(self.vllm_config, Attention).keys())
 
         # Reuse runner buffers for inputs and positions.
         # This is a MUST when using CUDA graphs.

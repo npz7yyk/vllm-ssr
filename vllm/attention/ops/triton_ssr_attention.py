@@ -735,6 +735,7 @@ def ssr_unified_attention(
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
+    sinks = None  # SSR does not use sinks
 
     block_size = v.shape[1]
     assert q.element_size() >= 2 or block_size >= 32, \

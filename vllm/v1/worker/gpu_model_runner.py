@@ -1015,6 +1015,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_computed_tokens_cpu = (
             self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs])
         spec_decode_common_attn_metadata = None
+        # SSR wishes to collect common attention metadatas for kv groups.
+        if self.speculative_config and isinstance(self.drafter, SSRProposer):
+            spec_decode_common_attn_metadata = {}
         if use_spec_decode:
             self.num_accepted_tokens.np[:num_reqs] = (
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs])
@@ -1077,6 +1080,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if self.speculative_config and \
                 spec_decode_common_attn_metadata is None:
                 spec_decode_common_attn_metadata = common_attn_metadata
+            if self.speculative_config and \
+                    isinstance(spec_decode_common_attn_metadata, dict):
+                spec_decode_common_attn_metadata[
+                    kv_cache_group_id] = common_attn_metadata
 
             for attn_group in self.attn_groups[kv_cache_group_id]:
                 # Prepare for cascade attention if enabled & beneficial.
@@ -2311,6 +2318,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
         elif self.speculative_config.method == "ssr":
             assert isinstance(self.drafter, SSRProposer)
+            assert isinstance(common_attn_metadata, dict)
+            common_attn_metadata: dict[int, CommonAttentionMetadata]
+
             # TODO(woosuk): Refactor the loop.
             req_ids = self.input_batch.req_ids
             next_token_ids: list[int] = []
@@ -2332,10 +2342,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                                           device=self.device)
 
             if spec_decode_metadata is None:
-                # input_ids can be None for multimodal models.
-                target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
-                # TODO(woosuk): Support M-RoPE.
-                target_positions = self.positions.gpu[:num_scheduled_tokens]
+                for i, attn_metadata in common_attn_metadata.items():
+                    if i == 0:
+                        continue
+                    # Use clone to avoid referencing the same tensor.
+                    attn_metadata.seq_lens = attn_metadata.seq_lens.clone()
             else:
                 # TODO(woosuk): Refactor this.
                 num_draft_tokens = spec_decode_metadata.num_draft_tokens
@@ -2345,9 +2356,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 ]
                 num_rejected_tokens_cpu = torch.tensor(num_rejected_tokens,
                                                        dtype=torch.int32)
-                common_attn_metadata, token_indices =\
-                    self.drafter.prepare_inputs(
-                        common_attn_metadata, num_rejected_tokens_cpu)
+                new_common_attn_metadata = {}
+                for i, attn_metadata in common_attn_metadata.items():
+                    new_common_attn_metadata[i] = self.drafter.prepare_inputs(
+                        attn_metadata, num_rejected_tokens_cpu)
+                common_attn_metadata = new_common_attn_metadata
 
             mm_embeds = None
             if self.supports_mm_inputs:

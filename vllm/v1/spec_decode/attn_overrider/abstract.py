@@ -64,6 +64,19 @@ class LayerIndexer:
             self._current_pos = 0
 
 
+def is_sliding_window_layer(layer: Attention) -> bool:
+    """Check if the given layer is a sliding window attention layer.
+
+    Args:
+        layer: The attention layer to check.
+
+    Returns:
+        True if the layer is a sliding window attention layer, False otherwise.
+    """
+    assert isinstance(layer.impl, TritonAttentionImpl)
+    return layer.impl.sliding_window != (-1, -1)
+
+
 class AbstractAttentionOverrider(abc.ABC):
     """ An interface for overriding attention computation. """
 
@@ -94,9 +107,14 @@ class AbstractAttentionOverrider(abc.ABC):
         # Override the original attention function
         def overriden_attention(*args, **kwargs):
             return self._overriden_attention(*args, **kwargs)
-        for layer in self.layer_indexer.layers:
+        self.effective_layer_indices = []
+        for idx, layer in enumerate(self.layer_indexer.layers):
             assert isinstance(layer.impl, TritonAttentionImpl)
             layer.impl.unified_attention = overriden_attention
+            if not is_sliding_window_layer(layer):
+                self.effective_layer_indices.append(idx)
+        assert self.effective_layer_indices
+        self.min_effective_layer_index = min(self.effective_layer_indices)
 
         # The current speculative step.
         # 0 means target verification.
