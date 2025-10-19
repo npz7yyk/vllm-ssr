@@ -29,16 +29,13 @@ def build_attention_overrider(
     # Resolve the attention overrider class.
     if method is None:
         method = "ssr"
-        logger.info(f"'{METHOD_KEY}' field not specified. Defaulting to 'ssr'.")
+        logger.info(f"'{METHOD_KEY}' not specified. Defaulting to 'ssr'.")
     if method == "ssr":
         from .ssr import SSRAttentionOverrider
         cls = SSRAttentionOverrider
     elif method == "sliding_window":
         from .sliding_window import SlidingWindowAttentionOverrider
         cls = SlidingWindowAttentionOverrider
-    elif method == "retroinfer":
-        from .retroinfer import RetroInferAttentionOverrider
-        cls = RetroInferAttentionOverrider
     else:
         raise ValueError(f"Unknown SSR attention overrider: {method}")
     cls_name = cls.__name__.strip('\'')
