@@ -95,46 +95,24 @@ class SSRProposer:
 
     def remap_metadata(
         self,
+        req_id_to_index: dict[str, int],
         num_draft_tokens: np.ndarray,
-        req_id_to_index: dict[int, int],
-        finished_req_ids: list[int],
     ):
-        # 1. Remap the draft probabilities based on the new request IDs.
-        # Major computation is conducted on CPU.
-        # Will be conducted in the runner's CPU logic region.
-        prev_req_id_to_index = self.req_id_to_index
-
-        # Skip remmapping if possible.
-        if all(n == self.num_speculative_tokens for n in num_draft_tokens) \
-                and req_id_to_index == prev_req_id_to_index:
-            self.cu_gather_indices = None
-
-        # Number of requests is small, so we use a simple loop here.
-        index_to_req_id = {v: k for k, v in req_id_to_index.items()}
-        gather_indices = []
-        for idx, count in enumerate(num_draft_tokens):
-            req_id = index_to_req_id[idx]
-            # Nothing to gather for this request.
-            if count == 0:
-                continue
-            assert req_id in prev_req_id_to_index
-            start = prev_req_id_to_index[req_id] * self.vllm_config.\
-                speculative_config.num_speculative_tokens
-            end = start + count
-            gather_indices += list(range(start, end))
-        self.cu_gather_indices = torch.tensor(
-            gather_indices, pin_memory=self.runner.pin_memory
-        ).to(self.device, non_blocking=True)
-
-        # 2. Update the index to metadata mapping.
+        # 1. Update the index to metadata mapping.
         # Remove finished requests.
+        finished_req_ids = \
+            set(self.req_id_to_metadata.keys()) - set(req_id_to_index.keys())
         for req_id in finished_req_ids:
-            assert req_id in self.req_id_to_metadata
             metadata_index = self.req_id_to_metadata[req_id]
             self.metadata_in_use[metadata_index] = False
             del self.req_id_to_metadata[req_id]
 
+        # Build the index to request ID mapping.
+        # Number of requests is small, so we use a simple loop here.
+        index_to_req_id = {v: k for k, v in req_id_to_index.items()}
+
         # Build the index to metadata tensor.
+        # TODO (Yikang): Can be optimized by checking against the history.
         index_to_metadata = []
         is_new_req = []
         metadata_ptr = 0
@@ -155,6 +133,35 @@ class SSRProposer:
             index_to_metadata.append(metadata_index)
         self.attention_overrider.update_metadata_mappings(
             index_to_metadata, is_new_req)
+
+        # 2. Remap the draft probabilities based on the new request IDs.
+        # Major computation is conducted on CPU.
+        # Will be conducted in the runner's CPU logic region.
+        # Early exit if no draft tokens.
+        if num_draft_tokens is None:
+            return
+
+        # Skip remmapping if possible.
+        prev_req_id_to_index = self.req_id_to_index
+        if all(n == self.num_speculative_tokens for n in num_draft_tokens) \
+                and req_id_to_index == prev_req_id_to_index:
+            self.cu_gather_indices = None
+            return
+
+        gather_indices = []
+        for idx, count in enumerate(num_draft_tokens):
+            req_id = index_to_req_id[idx]
+            # Nothing to gather for this request.
+            if count == 0:
+                continue
+            assert req_id in prev_req_id_to_index
+            start = prev_req_id_to_index[req_id] * self.vllm_config.\
+                speculative_config.num_speculative_tokens
+            end = start + count
+            gather_indices += list(range(start, end))
+        self.cu_gather_indices = torch.tensor(
+            gather_indices, pin_memory=self.runner.pin_memory
+        ).to(self.device, non_blocking=True)
 
     @property
     def draft_probs(self) -> torch.Tensor:

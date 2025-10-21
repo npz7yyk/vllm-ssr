@@ -991,19 +991,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 num_draft_tokens[req_idx] = len(draft_token_ids)
 
-            # SSR maintains draft_probs, need to remap
-            if self.speculative_config.method == "ssr":
-                self.drafter.remap_metadata(
-                    num_draft_tokens, self.input_batch.req_id_to_index,
-                    scheduler_output.finished_req_ids,
-                )
-
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens)
             logits_indices = spec_decode_metadata.logits_indices
             self.num_draft_tokens.np[:num_reqs] = num_draft_tokens
             self.num_draft_tokens.np[num_reqs:].fill(0)
             self.num_draft_tokens.copy_to_gpu()
+
+        # SSR needs to remap some metadata.
+        if self.speculative_config and self.speculative_config.method == "ssr":
+            self.drafter.remap_metadata(
+                self.input_batch.req_id_to_index, num_draft_tokens)
 
         logits_indices_padded = None
         if self.cache_config.kv_sharing_fast_prefill:
