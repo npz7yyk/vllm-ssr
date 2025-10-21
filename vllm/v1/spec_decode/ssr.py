@@ -79,6 +79,10 @@ class SSRProposer:
         # Determine allowed attention backends once during initialization.
         self.allowed_attn_types = (TritonAttentionMetadata,)
 
+        # Used to resolve the request ID to metadata index mapping.
+        self.req_id_to_metadata: dict[str, int] = {}
+        self.metadata_in_use: list[bool] = [False] * max_batch_size
+
     def _sample(
         self,
         logits: torch.Tensor,
@@ -89,10 +93,15 @@ class SSRProposer:
         """
         return self.runner.sampler(logits, sampling_metadata)
 
-    def remap_prev_draft_probs(self, num_draft_tokens: np.ndarray):
+    def remap_metadata(
+        self,
+        num_draft_tokens: np.ndarray,
+        req_id_to_index: dict[int, int],
+        finished_req_ids: list[int],
+    ):
+        # 1. Remap the draft probabilities based on the new request IDs.
         # Major computation is conducted on CPU.
         # Will be conducted in the runner's CPU logic region.
-        req_id_to_index = self.runner.input_batch.req_id_to_index
         prev_req_id_to_index = self.req_id_to_index
 
         # Skip remmapping if possible.
@@ -116,6 +125,36 @@ class SSRProposer:
         self.cu_gather_indices = torch.tensor(
             gather_indices, pin_memory=self.runner.pin_memory
         ).to(self.device, non_blocking=True)
+
+        # 2. Update the index to metadata mapping.
+        # Remove finished requests.
+        for req_id in finished_req_ids:
+            assert req_id in self.req_id_to_metadata
+            metadata_index = self.req_id_to_metadata[req_id]
+            self.metadata_in_use[metadata_index] = False
+            del self.req_id_to_metadata[req_id]
+
+        # Build the index to metadata tensor.
+        index_to_metadata = []
+        is_new_req = []
+        metadata_ptr = 0
+        for idx in range(len(index_to_req_id)):
+            req_id = index_to_req_id[idx]
+            metadata_index = self.req_id_to_metadata.get(req_id, -1)
+            # If metadata_index is -1, it means a new request
+            if metadata_index == -1:
+                while self.metadata_in_use[metadata_ptr]:
+                    metadata_ptr += 1
+                metadata_index = metadata_ptr
+                self.req_id_to_metadata[req_id] = metadata_index
+                self.metadata_in_use[metadata_index] = True
+                metadata_ptr += 1
+                is_new_req.append(True)
+            else:
+                is_new_req.append(False)
+            index_to_metadata.append(metadata_index)
+        self.attention_overrider.update_metadata_mappings(
+            index_to_metadata, is_new_req)
 
     @property
     def draft_probs(self) -> torch.Tensor:

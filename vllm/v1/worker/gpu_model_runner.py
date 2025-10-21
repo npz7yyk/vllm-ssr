@@ -993,7 +993,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # SSR maintains draft_probs, need to remap
             if self.speculative_config.method == "ssr":
-                self.drafter.remap_prev_draft_probs(num_draft_tokens)
+                self.drafter.remap_metadata(
+                    num_draft_tokens, self.input_batch.req_id_to_index,
+                    scheduler_output.finished_req_ids,
+                )
 
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens)
