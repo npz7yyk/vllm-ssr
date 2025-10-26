@@ -183,10 +183,6 @@ class SSRProposer:
         # For prototyping, mm, dp, pp, and kv_connector etc. are not supported.
         # TODO(Yikang): Add them back if needed.
 
-        # Do not draft if the attention overrider is not ready.
-        if not self.attention_overrider.ready_to_draft():
-            return None
-
         # Determine the batch size and the number of tokens to compute.
         num_tokens = next_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
@@ -194,6 +190,11 @@ class SSRProposer:
         self.req_id_to_index = dict(self.runner.input_batch.req_id_to_index)
         last_token_indices = self.arange[:batch_size]
         self.input_ids[:batch_size] = next_token_ids
+
+        # Do not draft if the attention overrider is not ready.
+        # Yikang: MUST be placed after registering req_id_to_index.
+        if not self.attention_overrider.ready_to_draft():
+            return None
 
         # FIXME: Lazy allocation of buffers. Not a good practice.
         if self._draft_probs is None or \
