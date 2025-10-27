@@ -9,72 +9,96 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
 
 
-# FIXME: LayerIndexer has strong assumptions on the layer names.
+# FIXME: This function has strong assumptions on the layer names.
 #        It may not work for some models.
+def _parse_layer_index(name: str) -> int:
+    """ Parse the layer index from the layer name.
+
+    Args:
+        name: The name of the layer.
+
+    Returns:
+        The layer index extracted from the layer name.
+
+    """
+    # Try1: match digits between dots.
+    match = re.search(r'\.(\d+)\.', name)
+    if match:
+        return int(match.group(1))
+    # Try2: match any digits, take the first match.
+    match = re.search(r'\d+', name)
+    if match:
+        return int(match.group(0))
+    raise ValueError(f"Cannot parse layer index from layer {name}.")
+
+
+def _should_override(layer: Attention) -> bool:
+    """Check if the given attention layer should be overridden.
+
+    Currently identified attention layers that should NOT be overridden:
+        1. Sliding window attention layers.
+    TODO: Add more if needed.
+
+    Args:
+        layer: The attention layer to check.
+
+    Returns:
+        True if the layer should be overridden, False otherwise.
+    """
+    assert isinstance(layer.impl, TritonAttentionImpl)
+
+    # Check for sliding window attention.
+    if layer.impl.sliding_window != (-1, -1):
+        return False
+
+    return True
+
+
 class LayerIndexer:
     """A utility class to iterate over layer indices."""
 
     def __init__(self, vllm_config: VllmConfig):
         # Get attention layers from the vllm config.
         attn_layers = get_layers_from_vllm_config(vllm_config, Attention)
+        self.attn_layers = list(attn_layers.values())
 
         # Collect layer indices from layer names.
-        between_dots = re.compile(r'\.(\d+)\.')
-        any_digits = re.compile(r'\d+')
-        layer_with_indices: list[tuple[int, Attention]] = []
+        layer_metadata_list = []
         # Try to extract the layer index from the layer name.
         for name, layer in attn_layers.items():
-            # Try1: match digits between dots.
-            match = between_dots.search(name)
-            if match:
-                layer_with_indices.append((int(match.group(1)), layer))
-                continue
-            # Try2: match any digits, take the first match.
-            match = any_digits.search(name)
-            if match:
-                layer_with_indices.append((int(match.group(0)), layer))
-                continue
-            # Failed to parse the layer index.
-            raise ValueError(f"Cannot parse layer index from layer {name}.")
+            layer_index = _parse_layer_index(name)
+            should_override = _should_override(layer)
+            layer_metadata_list.append((layer_index, should_override, layer))
 
         # Build the layer index iterator.
-        self._layer_with_indices = sorted(layer_with_indices)
-        self._num_layers = len(self._layer_with_indices)
-        self._current_pos = 0
+        self._layer_metadata_list: list[tuple[int, bool, Attention]] = \
+            sorted(layer_metadata_list, key=lambda x: x[0])
+        self._num_layers = len(self._layer_metadata_list)
+        self._ptr = 0
+
+        # Collect override layer indices.
+        self.override_layer_indices = [
+            idx for idx, should_override, _ in self._layer_metadata_list
+            if should_override
+        ]
+        self.min_override_layer_index = min(self.override_layer_indices)
 
     def is_reset(self) -> bool:
-        return self._current_pos == 0
-
-    @property
-    def layers(self) -> list[Attention]:
-        return [layer for _, layer in self._layer_with_indices]
+        return self._ptr == 0
 
     @property
     def num_layers(self) -> int:
         return self._num_layers
 
     @property
-    def current_layer(self) -> tuple[int, Attention]:
-        return self._layer_with_indices[self._current_pos]
+    def current_layer(self) -> tuple[int, bool, Attention]:
+        return self._layer_metadata_list[self._ptr]
 
     def step(self):
-        if self._current_pos + 1 < self._num_layers:
-            self._current_pos += 1
+        if self._ptr + 1 < self._num_layers:
+            self._ptr += 1
         else:
-            self._current_pos = 0
-
-
-def is_sliding_window_layer(layer: Attention) -> bool:
-    """Check if the given layer is a sliding window attention layer.
-
-    Args:
-        layer: The attention layer to check.
-
-    Returns:
-        True if the layer is a sliding window attention layer, False otherwise.
-    """
-    assert isinstance(layer.impl, TritonAttentionImpl)
-    return layer.impl.sliding_window != (-1, -1)
+            self._ptr = 0
 
 
 class AbstractAttentionOverrider(abc.ABC):
@@ -107,14 +131,13 @@ class AbstractAttentionOverrider(abc.ABC):
         # Override the original attention function
         def overriden_attention(*args, **kwargs):
             return self._overriden_attention(*args, **kwargs)
-        self.effective_layer_indices = []
-        for idx, layer in enumerate(self.layer_indexer.layers):
+        for idx, layer in enumerate(self.layer_indexer.attn_layers):
             assert isinstance(layer.impl, TritonAttentionImpl)
             layer.impl.unified_attention = overriden_attention
-            if not is_sliding_window_layer(layer):
-                self.effective_layer_indices.append(idx)
-        assert self.effective_layer_indices
-        self.min_effective_layer_index = min(self.effective_layer_indices)
+        self.effective_layer_indices = \
+            self.layer_indexer.override_layer_indices
+        self.min_effective_layer_index = \
+            self.layer_indexer.min_override_layer_index
 
         # The current speculative step.
         # 0 means target verification.
@@ -149,11 +172,11 @@ class AbstractAttentionOverrider(abc.ABC):
         assert self.layer_indexer.is_reset()
         self.current_draft_step = step
 
-    def _get_layer(self) -> tuple[int, Attention]:
-        """Get the current layer index and object.
+    def _get_layer(self) -> tuple[int, bool, Attention]:
+        """Get the current layer metadata and step the layer indexer.
 
         Returns:
-            The current layer index and object.
+            A tuple of (layer_index, should_override, layer).
         """
         rst = self.layer_indexer.current_layer
         self.layer_indexer.step()
@@ -173,9 +196,12 @@ class AbstractAttentionOverrider(abc.ABC):
                 indicating whether the requests are new requests or not.
         """
         batch_size = len(index_to_metadata)
-        self.index_to_metadata[:batch_size].copy_(torch.tensor(
-            index_to_metadata, dtype=torch.int32, pin_memory=True
+        # Update if provided.
+        if index_to_metadata:
+            self.index_to_metadata[:batch_size].copy_(torch.tensor(
+                index_to_metadata, dtype=torch.int32, pin_memory=True
             ), non_blocking=True)
-        self.is_new_req[:batch_size].logical_or_(torch.tensor(
-            is_new_req, dtype=torch.bool, pin_memory=True
-            ).to(self.device, non_blocking=True))
+        if is_new_req:
+            self.is_new_req[:batch_size].copy_(torch.tensor(
+                is_new_req, dtype=torch.bool, pin_memory=True
+            ), non_blocking=True)

@@ -5,7 +5,7 @@ import triton.language as tl
 from vllm.attention.ops.triton_ssr_attention import ssr_unified_attention
 from vllm.config import VllmConfig
 from vllm.vllm_flash_attn import flash_attn_with_kvcache
-from .abstract import AbstractAttentionOverrider, is_sliding_window_layer
+from .abstract import AbstractAttentionOverrider
 
 
 @triton.jit
@@ -365,11 +365,10 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
 
     def _overriden_kv_insert(self, *args, **kwargs):
         # Get the current layer index.
-        self.layer_index, layer = self._get_layer()
-        self.is_effective_layer = not is_sliding_window_layer(layer)
+        self.layer_index, self.should_override, _ = self._get_layer()
 
         # Determine whether to insert into the topk cache.
-        if self.enable_topk and self.in_draft and self.is_effective_layer:
+        if self.enable_topk and self.in_draft and self.should_override:
             # Insert into the topk cache.
             self._draft_kv_insert(*args, **kwargs)
         else:
@@ -516,7 +515,7 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
 
         # Determine which attention function to use.
         # If not using top-k, fall back to the original attention function.
-        if not self.enable_topk or not self.is_effective_layer:
+        if not self.enable_topk or not self.should_override:
             self.original_attention_func(*args, **kwargs)
             return
 
