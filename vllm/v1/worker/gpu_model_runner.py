@@ -998,11 +998,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.num_draft_tokens.np[num_reqs:].fill(0)
             self.num_draft_tokens.copy_to_gpu()
 
-        # SSR needs to remap some metadata.
-        if self.speculative_config and self.speculative_config.method == "ssr":
-            self.drafter.remap_metadata(
-                self.input_batch.req_id_to_index, num_draft_tokens)
-
         logits_indices_padded = None
         if self.cache_config.kv_sharing_fast_prefill:
             logits_indices_padded = self._prepare_kv_sharing_fast_prefill(
@@ -1016,9 +1011,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_computed_tokens_cpu = (
             self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs])
         spec_decode_common_attn_metadata = None
-        # SSR wishes to collect common attention metadatas for kv groups.
+        # SSR wishes to collect common attn metadatas for different kv groups.
+        # Besides, it needs to remap metadata based on num_draft_tokens.
         if self.speculative_config and isinstance(self.drafter, SSRProposer):
             spec_decode_common_attn_metadata = {}
+            self.drafter.remap_metadata(num_draft_tokens)
         if use_spec_decode:
             self.num_accepted_tokens.np[:num_reqs] = (
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs])

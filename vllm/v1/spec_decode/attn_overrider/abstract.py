@@ -7,6 +7,7 @@ from vllm.attention.layer import Attention
 from vllm.attention.ops.triton_unified_attention import unified_attention
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+from vllm.v1.utils import CpuGpuBuffer
 
 
 # FIXME: This function has strong assumptions on the layer names.
@@ -104,6 +105,9 @@ class LayerIndexer:
 class AbstractAttentionOverrider(abc.ABC):
     """ An interface for overriding attention computation. """
 
+    # Whether metadata remapping is needed.
+    needs_metadata_remapping: bool = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -143,13 +147,23 @@ class AbstractAttentionOverrider(abc.ABC):
         # 0 means target verification.
         self.current_draft_step = 0
 
-        # Metadata mappings.
-        self.index_to_metadata = torch.empty(
+        # Metadata mappings (index to metadata slot).
+        self.index_to_metadata_buffer = CpuGpuBuffer(
             vllm_config.scheduler_config.max_num_seqs,
-            dtype=torch.int32, device=self.device)
-        self.is_new_req = torch.empty(
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=True)
+        self.index_to_metadata = self.index_to_metadata_buffer.gpu
+        # Indicate whether each request is new.
+        self.is_new_req_buffer = CpuGpuBuffer(
             vllm_config.scheduler_config.max_num_seqs,
-            dtype=torch.bool, device=self.device)
+            dtype=torch.bool,
+            device=self.device,
+            pin_memory=True)
+        self.is_new_req = torch.zeros(
+            vllm_config.scheduler_config.max_num_seqs,
+            dtype=torch.bool,
+            device=self.device)
 
     @abc.abstractmethod
     def _overriden_kv_insert(self):
@@ -172,6 +186,10 @@ class AbstractAttentionOverrider(abc.ABC):
         assert self.layer_indexer.is_reset()
         self.current_draft_step = step
 
+        # Trigger remaining work of metadata remapping here.
+        if step == 1 and self.needs_metadata_remapping:
+            self.is_new_req.logical_or_(self.is_new_req_buffer.gpu)
+
     def _get_layer(self) -> tuple[int, bool, Attention]:
         """Get the current layer metadata and step the layer indexer.
 
@@ -182,26 +200,11 @@ class AbstractAttentionOverrider(abc.ABC):
         self.layer_indexer.step()
         return rst
 
-    def update_metadata_mappings(
-        self,
-        index_to_metadata: list[int],
-        is_new_req: list[bool]
-    ):
+    def update_metadata_mappings(self, batch_size: int):
         """Update the request metadata mappings.
 
         Args:
-            index_to_metadata: A list of length batch_size,
-                mapping from the draft index to the metadata index.
-            is_new_req: A list of length batch_size,
-                indicating whether the requests are new requests or not.
+            batch_size: The current batch size.
         """
-        batch_size = len(index_to_metadata)
-        # Update if provided.
-        if index_to_metadata:
-            self.index_to_metadata[:batch_size].copy_(torch.tensor(
-                index_to_metadata, dtype=torch.int32, pin_memory=True
-            ), non_blocking=True)
-        if is_new_req:
-            self.is_new_req[:batch_size].copy_(torch.tensor(
-                is_new_req, dtype=torch.bool, pin_memory=True
-            ), non_blocking=True)
+        self.index_to_metadata_buffer.copy_to_gpu(batch_size)
+        self.is_new_req_buffer.copy_to_gpu(batch_size)

@@ -7,9 +7,6 @@ from .abstract import AbstractAttentionOverrider
 class SlidingWindowAttentionOverrider(AbstractAttentionOverrider):
     """An attention overrider that implements sliding window attention."""
 
-    # Wether this overrider uses a private attention implementation.
-    use_private_attention = False
-
     def __init__(
         self,
         # Base class args.

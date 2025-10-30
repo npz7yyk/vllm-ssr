@@ -79,6 +79,12 @@ class SSRProposer:
         # Determine allowed attention backends once during initialization.
         self.allowed_attn_types = (TritonAttentionMetadata,)
 
+        # Used to gather draft probs from previous batch.
+        self.draft_skipped = False
+        self.batch_size = 0
+        self.req_id_to_index: dict[str, int] = {}
+        self.cu_gather_indices: Optional[torch.Tensor] = None
+
         # Used to resolve the request ID to metadata index mapping.
         self.req_id_to_metadata: dict[str, int] = {}
         self.metadata_in_use: list[bool] = [False] * max_batch_size
@@ -93,30 +99,64 @@ class SSRProposer:
         """
         return self.runner.sampler(logits, sampling_metadata)
 
-    def remap_metadata(
-        self,
-        req_id_to_index: dict[str, int],
-        num_draft_tokens: np.ndarray,
-    ):
-        # 1. Update the index to metadata mapping.
-        # Remove finished requests.
-        finished_req_ids = \
-            set(self.req_id_to_metadata.keys()) - set(req_id_to_index.keys())
+    def remap_metadata(self, num_draft_tokens: np.ndarray):
+        # Save reset gather indices to None.
+        self.cu_gather_indices = None
+
+        # Get the new req_id_to_index mapping.
+        new_req_id_to_index = self.runner.input_batch.req_id_to_index
+        # Check whether the mapping is the same.
+        same_mapping = new_req_id_to_index == self.req_id_to_index
+
+        # Determine whether we need to remap attention metadata.
+        should_remap_attn_metadata = not same_mapping and \
+            self.attention_overrider.needs_metadata_remapping
+
+        # Determine whether we need to remap draft_probs.
+        if num_draft_tokens is None or self.draft_skipped:
+            should_remap_prev_draft_probs = False
+        else:
+            should_remap_prev_draft_probs = not same_mapping or \
+                np.any(num_draft_tokens != self.num_speculative_tokens)
+
+        # Create index to req_id mapping if needed.
+        if should_remap_prev_draft_probs or should_remap_attn_metadata:
+            index_to_req_id = {v: k for k, v in new_req_id_to_index.items()}
+
+        # Remap attention metadata if needed.
+        if should_remap_attn_metadata:
+            self._remap_sparse_attn_metadata(index_to_req_id)
+        # Remap draft probs if needed.
+        if should_remap_prev_draft_probs:
+            self._remap_prev_draft_probs(index_to_req_id, num_draft_tokens)
+
+        # Always update the mapping if the mapping is different.
+        if same_mapping:
+            return
+        self.req_id_to_index = dict(self.runner.input_batch.req_id_to_index)
+        self.batch_size = len(self.req_id_to_index)
+
+    def _remap_sparse_attn_metadata(self, index_to_req_id: dict[int, str]):
+        # Get the current req_id_to_index mapping.
+        req_id_to_index = self.runner.input_batch.req_id_to_index
+
+        # 1. Remove finished requests.
+        finished_req_ids = []
+        for req_id, metadata_index in self.req_id_to_metadata.items():
+            if req_id not in req_id_to_index:
+                finished_req_ids.append(req_id)
+                self.metadata_in_use[metadata_index] = False
+        # Avoid deleting while iterating.
         for req_id in finished_req_ids:
-            metadata_index = self.req_id_to_metadata[req_id]
-            self.metadata_in_use[metadata_index] = False
             del self.req_id_to_metadata[req_id]
 
-        # Build the index to request ID mapping.
-        # Number of requests is small, so we use a simple loop here.
-        index_to_req_id = {v: k for k, v in req_id_to_index.items()}
-
-        # Build the index to metadata tensor.
-        # TODO (Yikang): Can be optimized by checking against the history.
-        index_to_metadata = []
-        is_new_req = []
+        # 2. Modify the index to metadata cpu tensor.
+        index_to_metadata = \
+            self.attention_overrider.index_to_metadata_buffer.cpu
+        is_new_req = self.attention_overrider.is_new_req_buffer.cpu
         metadata_ptr = 0
-        for idx in range(len(index_to_req_id)):
+        batch_size = len(index_to_req_id)
+        for idx in range(batch_size):
             req_id = index_to_req_id[idx]
             metadata_index = self.req_id_to_metadata.get(req_id, -1)
             # If metadata_index is -1, it means a new request
@@ -127,47 +167,50 @@ class SSRProposer:
                 self.req_id_to_metadata[req_id] = metadata_index
                 self.metadata_in_use[metadata_index] = True
                 metadata_ptr += 1
-                is_new_req.append(True)
+                is_new_req[idx] = True
             else:
-                is_new_req.append(False)
-            index_to_metadata.append(metadata_index)
-        self.attention_overrider.update_metadata_mappings(
-            index_to_metadata, is_new_req)
+                is_new_req[idx] = False
+            index_to_metadata[idx] = metadata_index
 
-        # 2. Remap the draft probabilities based on the new request IDs.
-        # Major computation is conducted on CPU.
-        # Will be conducted in the runner's CPU logic region.
-        # Early exit if no draft tokens.
-        if num_draft_tokens is None:
-            return
+        # 3. Launch the CPU to GPU copy.
+        self.attention_overrider.update_metadata_mappings(batch_size)
 
-        # Skip remmapping if possible.
+    def _remap_prev_draft_probs(
+        self,
+        index_to_req_id: dict[int, str],
+        num_draft_tokens: np.ndarray,
+    ):
+        # Find the place of draft probs for each request in the previous batch.
         prev_req_id_to_index = self.req_id_to_index
-        if all(n == self.num_speculative_tokens for n in num_draft_tokens) \
-                and req_id_to_index == prev_req_id_to_index:
-            self.cu_gather_indices = None
-            return
-
         gather_indices = []
         for idx, count in enumerate(num_draft_tokens):
             req_id = index_to_req_id[idx]
             # Nothing to gather for this request.
             if count == 0:
                 continue
-            assert req_id in prev_req_id_to_index
-            start = prev_req_id_to_index[req_id] * self.vllm_config.\
-                speculative_config.num_speculative_tokens
+            start = prev_req_id_to_index[req_id] * self.num_speculative_tokens
             end = start + count
             gather_indices += list(range(start, end))
+
+        # Copy the gather indices to GPU.
         self.cu_gather_indices = torch.tensor(
             gather_indices, pin_memory=self.runner.pin_memory
         ).to(self.device, non_blocking=True)
 
     @property
     def draft_probs(self) -> torch.Tensor:
-        buffer = self._draft_probs[:self.batch_size].view(-1, self.vocab_size)
-        return buffer if self.cu_gather_indices is None else \
-            buffer.index_select(0, self.cu_gather_indices)
+        # Early exit if we skipped drafting.
+        if self.draft_skipped:
+            return None
+
+        # Gather the draft probs from previous batch.
+        # Avoid gathering when possible (i.e., cu_gather_indices is None).
+        if self.cu_gather_indices is not None:
+            rst = self._draft_probs.view(-1, self.vocab_size)
+            rst = rst.index_select(0, self.cu_gather_indices)
+        else:
+            rst = self._draft_probs[:self.batch_size].view(-1, self.vocab_size)
+        return rst
 
     @property
     def sampled_token_ids(self) -> torch.Tensor:
@@ -183,18 +226,18 @@ class SSRProposer:
         # For prototyping, mm, dp, pp, and kv_connector etc. are not supported.
         # TODO(Yikang): Add them back if needed.
 
+        # Do not draft if the attention overrider is not ready.
+        if not self.attention_overrider.ready_to_draft():
+            self.draft_skipped = True
+            return None
+        # We are drafting.
+        self.draft_skipped = False
+
         # Determine the batch size and the number of tokens to compute.
         num_tokens = next_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
-        self.batch_size = batch_size
-        self.req_id_to_index = dict(self.runner.input_batch.req_id_to_index)
         last_token_indices = self.arange[:batch_size]
         self.input_ids[:batch_size] = next_token_ids
-
-        # Do not draft if the attention overrider is not ready.
-        # Yikang: MUST be placed after registering req_id_to_index.
-        if not self.attention_overrider.ready_to_draft():
-            return None
 
         # FIXME: Lazy allocation of buffers. Not a good practice.
         if self._draft_probs is None or \
