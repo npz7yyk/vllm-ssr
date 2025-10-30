@@ -186,10 +186,6 @@ class AbstractAttentionOverrider(abc.ABC):
         assert self.layer_indexer.is_reset()
         self.current_draft_step = step
 
-        # Trigger remaining work of metadata remapping here.
-        if step == 1 and self.needs_metadata_remapping:
-            self.is_new_req.logical_or_(self.is_new_req_buffer.gpu)
-
     def _get_layer(self) -> tuple[int, bool, Attention]:
         """Get the current layer metadata and step the layer indexer.
 
@@ -208,3 +204,6 @@ class AbstractAttentionOverrider(abc.ABC):
         """
         self.index_to_metadata_buffer.copy_to_gpu(batch_size)
         self.is_new_req_buffer.copy_to_gpu(batch_size)
+        # Use logical_or to guarantee all new requests are marked.
+        self.is_new_req[:batch_size].logical_or_(
+            self.is_new_req_buffer.gpu[:batch_size])
