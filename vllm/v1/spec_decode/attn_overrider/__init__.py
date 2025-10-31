@@ -36,6 +36,12 @@ def build_attention_overrider(
     elif method == "sliding_window":
         from .sliding_window import SlidingWindowAttentionOverrider
         cls = SlidingWindowAttentionOverrider
+    elif method == "quest":
+        from .quest import QuestAttentionOverrider
+        cls = QuestAttentionOverrider
+    # elif method == "triforce":
+    #     from .triforce import TriforceAttentionOverrider
+    #     cls = TriforceAttentionOverrider
     else:
         raise ValueError(f"Unknown SSR attention overrider: {method}")
     cls_name = cls.__name__.strip('\'')
