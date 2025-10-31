@@ -167,7 +167,7 @@ def gather_kv_cache_triton(
 @triton.jit
 def sum_reduce_with_seqlen_mask_kernel(
     input_ptr,  # [sum(lens), num_q_head, max_seqlen]
-    output_ptr,  # [batch_size, max_seqlen]
+    output_ptr,  # [batch_size, max_seqlen] - PRE-FILLED with -inf
     cu_seqlens_q_ptr,  # [batch_size + 1]
     seqlens_ptr,  # [batch_size] - valid seqlen for each batch
     num_q_head: tl.constexpr,  # int
@@ -181,12 +181,15 @@ def sum_reduce_with_seqlen_mask_kernel(
 ):
     """
     Sum reduction over tokens and heads, respecting per-sequence valid lengths.
-    For positions >= seqlen[batch_idx], outputs -inf (then dropped by topk).
+
+    OPTIMIZATION: Output buffer is PRE-FILLED with -inf, so this kernel only
+    needs to write valid positions. Invalid positions remain as -inf.
+
     Args:
         input_ptr: [sum(lens), num_q_head, max_seqlen]
                    Where sum(lens) is total number of tokens across batch
                    lens[i] = number of tokens in sequence i (typically 1-16)
-        output_ptr: [batch_size, max_seqlen]
+        output_ptr: [batch_size, max_seqlen] - PRE-FILLED with -inf
         cu_seqlens_q_ptr: [batch_size + 1] cumulative lens
                         e.g., [0, 5, 12, 15] means lens = [5, 7, 3]
         seqlens_ptr: [batch_size] valid sequence positions
@@ -202,13 +205,13 @@ def sum_reduce_with_seqlen_mask_kernel(
     # Load valid sequence length
     valid_seqlen = tl.load(seqlens_ptr + batch_idx)
 
-    # Compute sequence positions for this block
+    # Compute sequence positions for this block and clamp to valid range
     seq_offsets = seq_block_idx * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
-    seq_in_bounds = seq_offsets < max_seqlen
+    seq_offsets = tl.minimum(seq_offsets, max_seqlen - 1)
     seq_is_valid = seq_offsets < valid_seqlen
 
-    # Initialize accumulator: 0 for valid positions, -inf for invalid
-    acc = tl.where(seq_is_valid, 0.0, float('-inf'))
+    # Initialize accumulator for valid positions only
+    acc = tl.zeros((BLOCK_SEQ,), dtype=tl.float32)
 
     # Sum over all tokens in this sequence
     for token_offset in range(num_tokens):
@@ -224,20 +227,20 @@ def sum_reduce_with_seqlen_mask_kernel(
 
             vals = tl.load(
                 input_ptr + input_offset,
-                mask=seq_in_bounds & seq_is_valid,
+                mask=seq_is_valid,
                 other=0.0
             )
 
-            # Only accumulate for valid positions
-            acc = tl.where(seq_is_valid, acc + vals, acc)
+            # Accumulate
+            acc += vals
 
-    # Store results
+    # Store only valid positions (invalid ones remain as pre-filled -inf)
     output_offset = \
         batch_idx * stride_output_batch + seq_offsets * stride_output_seq
     tl.store(
         output_ptr + output_offset,
         acc,
-        mask=seq_in_bounds
+        mask=seq_is_valid
     )
 
 
@@ -254,7 +257,7 @@ def sum_reduce_with_masking(
     Args:
         input_tensor: [sum(lens), num_q_head, max_seqlen]
                      sum(lens) = total tokens, typically batch_size * (1-16)
-        output_tensor: [batch_size, max_seqlen] - pre-allocated output
+        output_tensor: [batch_size, max_seqlen] - PRE-FILLED with -inf
         cu_seqlens: [batch_size + 1] - cumulative token counts
         seqlens: [batch_size] - valid sequence length for each batch element
         max_seqlen: int - maximum sequence length (32k-64k)
@@ -262,7 +265,7 @@ def sum_reduce_with_masking(
     Returns:
         output_tensor with:
         - [:, :seqlen[i]] = sum of input over tokens and heads
-        - [:, seqlen[i]:] = -inf (will be ignored by topk)
+        - [:, seqlen[i]:] = -inf (pre-filled, kernel doesn't touch these)
 
     Example:
         batch_size = 3
@@ -271,14 +274,14 @@ def sum_reduce_with_masking(
         seqlens = [2048, 32768, 512]  # valid positions per sequence
 
         input: [15, 8, 65536]  # 15 tokens, 8 heads, 64k max_seqlen
-        output: [3, 65536]
+        output: [3, 65536] pre-filled with -inf
 
+        Kernel writes:
         output[0, :2048] = sum(input[0:5, :, :2048])  # sum 5 tokens, 8 heads
-        output[0, 2048:] = -inf
         output[1, :32768] = sum(input[5:12, :, :32768])
-        output[1, 32768:] = -inf
         output[2, :512] = sum(input[12:15, :, :512])
-        output[2, 512:] = -inf
+
+        Rest remains -inf (pre-filled)
     """
     batch_size = cu_seqlens.shape[0] - 1
     num_q_head = input_tensor.shape[1]
@@ -546,10 +549,9 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
             attn_scores_reduced = attn_scores.sum(dim=1, dtype=torch.float32)
         else:
             # Non-uniform decode
-            # We need to create a mask for topk selection
-            # (batch_size, num_query_heads, focus_len)
-            attn_scores_reduced = torch.empty(
+            attn_scores_reduced = torch.full(
                 (self.batch_size, focus_len),
+                float('-inf'),
                 dtype=torch.float32,
                 device=attn_scores.device,
             )
