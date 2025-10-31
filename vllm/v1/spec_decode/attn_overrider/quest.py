@@ -322,7 +322,7 @@ class QuestAttentionOverrider(AbstractAttentionOverrider):
         vllm_config: VllmConfig,
         device: torch.device,
         # Quest specific args.
-        topk: int,
+        budget: int,
         max_batch_size: int,
         **_kwargs
     ):
@@ -358,7 +358,7 @@ class QuestAttentionOverrider(AbstractAttentionOverrider):
                            block_num=max_blocks_per_request,
                            dtype=dtype,
                            device=device)
-        self.k = topk
+        self.k = budget // self.block_size
 
     def ready_to_draft(self):
         return self._enable_quest
