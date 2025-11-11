@@ -361,7 +361,10 @@ class SSRProposer:
             # Otherwise, we may get out-of-range error in RoPE.
             positions = self.positions[:batch_size]
             exceeds_max_model_len = positions >= self.max_model_len
-            positions = torch.where(exceeds_max_model_len, 0, positions)
+            clamped_positions = \
+                torch.where(exceeds_max_model_len, 0, positions)
+            self.positions[:batch_size] = clamped_positions
+            positions = self.positions[:num_input_tokens]
 
             # Update the attention metadata.
             for attn_metadata in attn_metadatas:
@@ -374,12 +377,13 @@ class SSRProposer:
                 # sequence length to 1 to minimize the overheads in attention.
                 attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
                 # Compute the slot mapping.
-                block_numbers = positions // self.block_size
+                block_numbers = clamped_positions // self.block_size
                 block_ids = attn_metadata.block_table.gather(
                     dim=1, index=block_numbers.view(-1, 1))
                 block_ids = block_ids.view(-1)
-                attn_metadata.slot_mapping = \
-                    (block_ids * self.block_size + positions % self.block_size)
+                attn_metadata.slot_mapping = (
+                    block_ids * self.block_size +
+                    clamped_positions % self.block_size)
                 # Mask out the slot mappings that exceed the max model length.
                 # Otherwise, the KV cache will be inadvertently updated with
                 # the padding tokens.

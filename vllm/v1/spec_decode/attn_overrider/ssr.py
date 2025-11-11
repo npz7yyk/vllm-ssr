@@ -171,7 +171,6 @@ def sum_reduce_with_seqlen_mask_kernel(
     cu_seqlens_q_ptr,  # [batch_size + 1]
     seqlens_ptr,  # [batch_size] - valid seqlen for each batch
     num_q_head: tl.constexpr,  # int
-    max_seqlen,
     stride_input_token,
     stride_input_head,
     stride_input_seq,
@@ -207,7 +206,6 @@ def sum_reduce_with_seqlen_mask_kernel(
 
     # Compute sequence positions for this block and clamp to valid range
     seq_offsets = seq_block_idx * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
-    seq_offsets = tl.minimum(seq_offsets, max_seqlen - 1)
     seq_is_valid = seq_offsets < valid_seqlen
 
     # Initialize accumulator for valid positions only
@@ -298,7 +296,6 @@ def sum_reduce_with_masking(
         cu_seqlens,
         seqlens,
         num_q_head,
-        max_seqlen,
         input_tensor.stride(0),
         input_tensor.stride(1),
         input_tensor.stride(2),
@@ -505,7 +502,7 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
             self.block_table = kwargs['block_table'][:self.batch_size]
             self.max_seqlen_q: int = kwargs['max_seqlen_q']
             # Register number of query tokens.
-            self.num_query_tokens = self.batch_size * self.max_seqlen_q
+            self.num_query_tokens = cu_seqlens_q[-1]
             # Allocate memory if needed.
             self._may_allocate_topk_mem()
             # Track the context lengths for each sequence.
@@ -514,7 +511,7 @@ class SSRAttentionOverrider(AbstractAttentionOverrider):
             self.context_lens[:self.batch_size] = seqlens - seqlens_q + 1
             # Check whether it is uniform decode.
             self.uniform_decode = \
-                self.max_seqlen_q * self.batch_size == cu_seqlens_q[-1]
+                self.max_seqlen_q * self.batch_size == self.num_query_tokens
 
         # Determine which attention function to use.
         # If not using top-k, fall back to the original attention function.
